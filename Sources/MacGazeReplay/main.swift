@@ -44,6 +44,27 @@ struct MacGazeReplay {
         let dumpDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("patch-dump")
 
+        // Parse calibration windows: --calibrate "start:end:tx:ty start:end:tx:ty ..."
+        var calibWindows: [(start: Double, end: Double, targetX: Double, targetY: Double)] = []
+        if let calibIdx = args.firstIndex(of: "--calibrate"), calibIdx + 1 < args.count {
+            let spec = args[calibIdx + 1]
+            for segment in spec.split(separator: " ") {
+                let parts = segment.split(separator: ":")
+                if parts.count == 4,
+                   let s = Double(parts[0]), let e = Double(parts[1]),
+                   let tx = Double(parts[2]), let ty = Double(parts[3]) {
+                    calibWindows.append((s, e, tx, ty))
+                }
+            }
+            if !calibWindows.isEmpty {
+                print("Calibration mode: \(calibWindows.count) windows")
+                for w in calibWindows {
+                    print(String(format: "  %.1f-%.1fs → target (%.1f, %.1f)", w.start, w.end, w.targetX, w.targetY))
+                }
+                print("")
+            }
+        }
+
         let url = URL(fileURLWithPath: filePath)
         guard FileManager.default.fileExists(atPath: url.path) else {
             fputs("error: file not found: \(url.path)\n", stderr)
@@ -74,7 +95,8 @@ struct MacGazeReplay {
         } else {
             await processVideo(url: url, detector: detector, extractor: eyePatchExtractor,
                                headPose: headPose, blazeGaze: blazeGaze, verbose: verbose,
-                               dumpPatches: dumpPatches, dumpDir: dumpDir)
+                               dumpPatches: dumpPatches, dumpDir: dumpDir,
+                               calibWindows: calibWindows)
         }
     }
 
@@ -100,7 +122,8 @@ struct MacGazeReplay {
         blazeGaze: BlazeGazeRunner,
         verbose: Bool,
         dumpPatches: Bool = false,
-        dumpDir: URL = URL(fileURLWithPath: ".")
+        dumpDir: URL = URL(fileURLWithPath: "."),
+        calibWindows: [(start: Double, end: Double, targetX: Double, targetY: Double)] = []
     ) async {
         let asset = AVURLAsset(url: url)
         guard let track = asset.tracks(withMediaType: .video).first else {
@@ -130,6 +153,10 @@ struct MacGazeReplay {
         var faceFrames = 0
         var gazeFrames = 0
         var latencies: [Double] = []
+        // Per-second gaze accumulation for calibration timing.
+        var perSecondGaze: [Int: (sumX: Double, sumY: Double, count: Int)] = [:]
+        // Store all gaze results for RBF post-processing.
+        var allGaze: [(t: Double, x: Double, y: Double)] = []
 
         while reader.status == .reading {
             guard let sampleBuffer = output.copyNextSampleBuffer() else { break }
@@ -211,6 +238,15 @@ struct MacGazeReplay {
                     gazeFrames += 1
                     let latency = Date().timeIntervalSince(t0) * 1000
                     latencies.append(latency)
+                    allGaze.append((timestamp, Double(gaze.x), Double(gaze.y)))
+
+                    // Accumulate per-second averages.
+                    let sec = Int(timestamp)
+                    var entry = perSecondGaze[sec] ?? (0, 0, 0)
+                    entry = (entry.sumX + Double(gaze.x),
+                             entry.sumY + Double(gaze.y),
+                             entry.count + 1)
+                    perSecondGaze[sec] = entry
 
                     if verbose || frameIndex % 30 == 0 {
                         print(String(format: "  frame %4d  t=%5.1fs  gaze=(%.3f, %.3f)  latency=%.1fms",
@@ -232,6 +268,123 @@ struct MacGazeReplay {
             print(String(format: "  Pipeline latency    : mean %.1fms  p50 %.1fms  p95 %.1fms",
                          mean, sorted[sorted.count / 2], sorted[Int(Double(sorted.count) * 0.95)]))
         }
+
+        // Per-second gaze averages for calibration timing.
+        if !perSecondGaze.isEmpty {
+            print("")
+            print("=== Per-second gaze (for calibration) ===")
+            print("  second |  avg X   |  avg Y   | samples")
+            for sec in perSecondGaze.keys.sorted() {
+                let g = perSecondGaze[sec]!
+                let avgX = g.sumX / Double(g.count)
+                let avgY = g.sumY / Double(g.count)
+                print(String(format: "  %5ds  |  %.4f  |  %.4f  |  %d", sec, avgX, avgY, g.count))
+            }
+            print("")
+            print("  Tell me which seconds = which direction you were looking,")
+            print("  e.g.: '0-2=center 2-4=left 4-6=right 6-8=up 8-10=down'")
+        }
+
+        // RBF calibration post-processing.
+        if !calibWindows.isEmpty && !allGaze.isEmpty {
+            print("")
+            print("=== RBF calibration ===")
+
+            // Collect calibration samples from the windows.
+            var calibSamples: [MacGaze.RBFGazeCorrector.CalibrationSample] = []
+            for window in calibWindows {
+                let windowGaze = allGaze.filter { $0.t >= window.start && $0.t < window.end }
+                guard !windowGaze.isEmpty else { continue }
+                let avgX = windowGaze.reduce(0.0) { $0 + $1.x } / Double(windowGaze.count)
+                let avgY = windowGaze.reduce(0.0) { $0 + $1.y } / Double(windowGaze.count)
+                calibSamples.append(MacGaze.RBFGazeCorrector.CalibrationSample(
+                    observedX: avgX, observedY: avgY,
+                    targetX: window.targetX, targetY: window.targetY
+                ))
+                print(String(format: "  window %.1f-%.1fs: observed (%.4f, %.4f) → target (%.1f, %.1f)  [%d samples]",
+                             window.start, window.end, avgX, avgY,
+                             window.targetX, window.targetY, windowGaze.count))
+            }
+
+            if calibSamples.count >= 3 {
+                let rbf = MacGaze.RBFGazeCorrector()
+                let success = rbf.calibrate(calibSamples)
+                print("")
+                print("  RBF solve: \(success ? "✓ success" : "✗ failed"), σ=\(String(format: "%.4f", rbf.solvedSigma)), \(calibSamples.count) points")
+
+                if success {
+                    print("")
+                    print("=== Corrected gaze (RBF applied) ===")
+                    print("  second |  raw X   |  raw Y   |  corr X  |  corr Y  |  direction")
+                    print("  -------+----------+----------+----------+----------+----------")
+
+                    // Group corrected results by second.
+                    var perSecondCorrected: [Int: (sumX: Double, sumY: Double, count: Int)] = [:]
+                    for g in allGaze {
+                        let corrected = rbf.correct(x: g.x, y: g.y)
+                        let sec = Int(g.t)
+                        var entry = perSecondCorrected[sec] ?? (0, 0, 0)
+                        entry = (entry.sumX + corrected.x, entry.sumY + corrected.y, entry.count + 1)
+                        perSecondCorrected[sec] = entry
+                    }
+
+                    for sec in perSecondCorrected.keys.sorted() {
+                        let raw = perSecondGaze[sec]!
+                        let corr = perSecondCorrected[sec]!
+                        let rawAvgX = raw.sumX / Double(raw.count)
+                        let rawAvgY = raw.sumY / Double(raw.count)
+                        let corrAvgX = corr.sumX / Double(corr.count)
+                        let corrAvgY = corr.sumY / Double(corr.count)
+
+                        // Determine which direction this second falls in.
+                        var direction = ""
+                        for w in calibWindows {
+                            if Double(sec) >= w.start && Double(sec) < w.end {
+                                let dx = abs(corrAvgX - w.targetX)
+                                let dy = abs(corrAvgY - w.targetY)
+                                direction = String(format: "target (%.1f,%.1f) err=%.3f", w.targetX, w.targetY, max(dx, dy))
+                                break
+                            }
+                        }
+
+                        print(String(format: "  %5ds  |  %.4f  |  %.4f  |  %.4f  |  %.4f  |  %@",
+                                     sec, rawAvgX, rawAvgY, corrAvgX, corrAvgY, direction.isEmpty ? "" : direction))
+                    }
+
+                    // Verdict.
+                    print("")
+                    var totalError: Double = 0
+                    var errorCount = 0
+                    for w in calibWindows {
+                        let windowGaze = allGaze.filter { $0.t >= w.start && $0.t < w.end }
+                        let corrected = windowGaze.compactMap { rbf.correct(x: $0.x, y: $0.y) }
+                        if !corrected.isEmpty {
+                            let avgX = corrected.reduce(0.0) { $0 + $1.x } / Double(corrected.count)
+                            let avgY = corrected.reduce(0.0) { $0 + $1.y } / Double(corrected.count)
+                            let dx = avgX - w.targetX
+                            let dy = avgY - w.targetY
+                            let err = (dx * dx + dy * dy).squareRoot()
+                            totalError += err
+                            errorCount += 1
+                        }
+                    }
+                    if errorCount > 0 {
+                        let meanErr = totalError / Double(errorCount)
+                        print(String(format: "  Mean calibration error: %.4f (normalised distance)", meanErr))
+                        if meanErr < 0.1 {
+                            print("  ✓ GOOD — corrected gaze lands within 10%% of targets")
+                        } else if meanErr < 0.2 {
+                            print("  ~ OKAY — corrected gaze is in the right ballpark")
+                        } else {
+                            print("  ⚠ POOR — needs more calibration points or better eye patch")
+                        }
+                    }
+                }
+            } else {
+                print("  Not enough calibration windows with data (need ≥3)")
+            }
+        }
+
         if gazeFrames > 0 {
             print("")
             print("  ✓ Pipeline produced gaze predictions from recorded video.")

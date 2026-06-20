@@ -64,7 +64,7 @@ public final class RBFGazeCorrector {
     /// Solved weight matrix.  N rows × 2 cols.
     private var weights: [Double] = []
     /// Kernel width used at solve time.
-    private(set) var solvedSigma: Double = 0
+    public private(set) var solvedSigma: Double = 0
     /// Whether a valid RBF fit exists.
     public private(set) var isCalibrated: Bool = false
 
