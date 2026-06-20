@@ -52,6 +52,13 @@ targets:
         LD_RUNPATH_SEARCH_PATHS:
           - "$(inherited)"
           - "@executable_path/../Frameworks"
+        # Disable Metal API validation + GPU wrapper to prevent
+        # GPUToolsCapture crash (-[__NSCFNumber length]) on M1.
+        # The crash occurs in Xcode's Metal debugging layer when it
+        # intercepts command buffer commits.  Not needed for production.
+        METAL_DEVICE_WRAPPER_TYPE: "0"
+        ENABLE_METAL_API_VALIDATION: NO
+        METAL_DEBUG_ERROR_MODE: "0"
     dependencies:
       - package: MacGaze
         product: MacGaze
