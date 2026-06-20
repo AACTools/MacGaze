@@ -185,8 +185,9 @@ final class DebugPipeline: ObservableObject {
     // MARK: Rendering
 
     /// Convert a 32BGRA CVPixelBuffer to an NSImage for display.
-    /// Uses pure CoreGraphics (no CIContext / Metal) to avoid the
-    /// Portrait/VFX camera effects Metal race.
+    /// Uses pure CoreGraphics with a **pixel data copy** to prevent a
+    /// use-after-free: the camera recycles CVPixelBuffers for the next
+    /// frame, so we must copy before handing the pointer to CGDataProvider.
     /// Mirrored horizontally for selfie view.
     private static func renderToNSImage(frame: CameraFrame) -> NSImage? {
         let buffer = frame.pixelBuffer
@@ -198,15 +199,32 @@ final class DebugPipeline: ObservableObject {
 
         guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else { return nil }
         let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        let dataSize = height * bytesPerRow
         let colorSpace = CGColorSpaceCreateDeviceRGB()
 
-        // Create CGImage directly from raw BGRA pixels (no CIContext).
-        guard let provider = CGDataProvider(
-            dataInfo: nil,
-            data: baseAddress,
-            size: height * bytesPerRow,
-            releaseData: { _, _, _ in }
-        ) else { return nil }
+        // CRITICAL: copy the pixel data into our own buffer.  The camera's
+        // CVPixelBuffer will be recycled for the next frame, and Core
+        // Animation may draw the CGImage asynchronously on a later display
+        // cycle.  Without a copy, we get a use-after-free that corrupts
+        // Metal reads → "-[__NSCFNumber length]" crash.
+        let dataCopy = UnsafeMutableRawPointer.allocate(byteCount: dataSize, alignment: 16)
+        memcpy(dataCopy, baseAddress, dataSize)
+
+        // Provider owns dataCopy; releases it when the CGImage is freed.
+        // We pass dataCopy as both dataInfo and data so the release callback
+        // can deallocate it.
+        let provider = CGDataProvider(
+            dataInfo: dataCopy,
+            data: dataCopy,
+            size: dataSize
+        ) { info, _, _ in
+            info?.deallocate()
+        }
+
+        guard let provider else {
+            dataCopy.deallocate()
+            return nil
+        }
 
         guard let cgImage = CGImage(
             width: width,
