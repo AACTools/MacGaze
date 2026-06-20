@@ -143,32 +143,60 @@ struct MacGazeReplay {
                 faceFrames += 1
 
                 if let vnFace = detector.lastRawObservation {
+                    let frameW = CVPixelBufferGetWidth(pixelBuffer)
+                    let frameH = CVPixelBufferGetHeight(pixelBuffer)
+
+                    // Debug: frame dimensions + bounding box.
+                    if verbose && frameIndex <= 3 {
+                        let bbox = vnFace.boundingBox
+                        print("  [debug] frame \(frameIndex): \(frameW)×\(frameH)  bbox=({\(String(format: "%.2f", bbox.origin.x)),\(String(format: "%.2f", bbox.origin.y))} \(String(format: "%.2f", bbox.width))×\(String(format: "%.2f", bbox.height)))")
+                        print("         landmarks: leftEye=\(vnFace.landmarks?.leftEye?.pointCount ?? 0)pts rightEye=\(vnFace.landmarks?.rightEye?.pointCount ?? 0)pts")
+                    }
+
                     // Eye patch.
-                    if let eyePatch = extractor.extract(
+                    guard let eyePatch = extractor.extract(
                         frame: frame.pixelBuffer,
                         faceObservation: vnFace
-                    ) {
-                        // Head pose.
-                        var hv: MLMultiArray? = nil
-                        var fo: MLMultiArray? = nil
-                        if let pose = headPose.estimate(face: vnFace, frameWidth: width, frameHeight: height) {
-                            hv = try? MLMultiArray(shape: [1, 3], dataType: .float32)
-                            fo = try? MLMultiArray(shape: [1, 3], dataType: .float32)
-                            if let hv { hv[0] = pose.headVector[0] as NSNumber; hv[1] = pose.headVector[1] as NSNumber; hv[2] = pose.headVector[2] as NSNumber }
-                            if let fo { fo[0] = pose.faceOrigin3D[0] as NSNumber; fo[1] = pose.faceOrigin3D[1] as NSNumber; fo[2] = pose.faceOrigin3D[2] as NSNumber }
+                    ) else {
+                        if verbose && frameIndex <= 5 {
+                            print("  [debug] frame \(frameIndex): eye patch extraction FAILED")
                         }
+                        continue
+                    }
 
-                        // BlazeGaze inference.
-                        if let gaze = blazeGaze.predict(eyePatch: eyePatch, headVector: hv, faceOrigin3D: fo) {
-                            gazeFrames += 1
-                            let latency = Date().timeIntervalSince(t0) * 1000
-                            latencies.append(latency)
+                    if verbose && frameIndex <= 3 {
+                        let ew = CVPixelBufferGetWidth(eyePatch)
+                        let eh = CVPixelBufferGetHeight(eyePatch)
+                        print("  [debug] frame \(frameIndex): eye patch \(ew)×\(eh)")
+                    }
 
-                            if verbose || frameIndex % 30 == 0 {
-                                print(String(format: "  frame %4d  t=%5.1fs  gaze=(%.3f, %.3f)  latency=%.1fms",
-                                             frameIndex, timestamp, gaze.x, gaze.y, latency))
-                            }
+                    // Head pose.
+                    var hv: MLMultiArray? = nil
+                    var fo: MLMultiArray? = nil
+                    if let pose = headPose.estimate(face: vnFace, frameWidth: frameW, frameHeight: frameH) {
+                        hv = try? MLMultiArray(shape: [1, 3], dataType: .float32)
+                        fo = try? MLMultiArray(shape: [1, 3], dataType: .float32)
+                        if let hv { hv[0] = pose.headVector[0] as NSNumber; hv[1] = pose.headVector[1] as NSNumber; hv[2] = pose.headVector[2] as NSNumber }
+                        if let fo { fo[0] = pose.faceOrigin3D[0] as NSNumber; fo[1] = pose.faceOrigin3D[1] as NSNumber; fo[2] = pose.faceOrigin3D[2] as NSNumber }
+                        if verbose && frameIndex <= 3 {
+                            print("  [debug] frame \(frameIndex): head_vec=(\(String(format: "%.3f", pose.headVector[0])), \(String(format: "%.3f", pose.headVector[1])), \(String(format: "%.3f", pose.headVector[2])))  origin=(\(String(format: "%.1f", pose.faceOrigin3D[0])), \(String(format: "%.1f", pose.faceOrigin3D[1])), \(String(format: "%.1f", pose.faceOrigin3D[2])))")
                         }
+                    }
+
+                    // BlazeGaze inference.
+                    guard let gaze = blazeGaze.predict(eyePatch: eyePatch, headVector: hv, faceOrigin3D: fo) else {
+                        if verbose && frameIndex <= 5 {
+                            print("  [debug] frame \(frameIndex): BlazeGaze prediction FAILED")
+                        }
+                        continue
+                    }
+                    gazeFrames += 1
+                    let latency = Date().timeIntervalSince(t0) * 1000
+                    latencies.append(latency)
+
+                    if verbose || frameIndex % 30 == 0 {
+                        print(String(format: "  frame %4d  t=%5.1fs  gaze=(%.3f, %.3f)  latency=%.1fms",
+                                     frameIndex, timestamp, gaze.x, gaze.y, latency))
                     }
                 }
             }

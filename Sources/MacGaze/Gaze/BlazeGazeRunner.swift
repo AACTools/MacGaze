@@ -120,10 +120,15 @@ public final class BlazeGazeRunner {
         let hv = headVector ?? Self.makeNeutralHeadVector()
         let fo = faceOrigin3D ?? Self.makeNeutralFaceOrigin()
 
-        let imageFeature = MLFeatureValue(pixelBuffer: eyePatch)
+        // Convert the eye-patch CVPixelBuffer to the MLMultiArray the model
+        // expects: shape (1, 128, 512, 3), float32, RGB, normalised [0,1].
+        // The model was trained on images normalised to [0,1] via /255.
+        guard let imageArray = Self.pixelBufferToMLMultiArray(eyePatch) else {
+            return nil
+        }
 
         let inputDict: [String: MLFeatureValue] = [
-            "image": imageFeature,
+            "image": MLFeatureValue(multiArray: imageArray),
             "head_vector": MLFeatureValue(multiArray: hv),
             "face_origin_3d": MLFeatureValue(multiArray: fo),
         ]
@@ -142,16 +147,59 @@ public final class BlazeGazeRunner {
             return nil
         }
 
-        // Find the gaze output. The exact name depends on the conversion;
-        // try common names then fall back to the first output feature.
+        // Find the gaze output.
         let outputName = outputProvider.featureNames.first ?? "gaze_output"
         guard let outputArray = outputProvider.featureValue(for: outputName)?.multiArrayValue else {
             return nil
         }
 
-        // Output shape is [1, 2] → (x, y) normalised.
         let x = outputArray[0].doubleValue
         let y = outputArray[1].doubleValue
         return CGPoint(x: x, y: y)
+    }
+
+    /// Convert a 32BGRA CVPixelBuffer to an MLMultiArray with shape
+    /// (1, H, W, 3), float32, RGB channel order, normalised to [0, 1].
+    ///
+    /// The BlazeGaze model was trained on float32 [0,1] RGB images in
+    /// NHWC layout (height × width × channels).  CoreML's MLMultiArray
+    /// is row-major, so element [0, y, x, c] is at linear index
+    /// (y * W + x) * 3 + c.
+    static func pixelBufferToMLMultiArray(_ buffer: CVPixelBuffer) -> MLMultiArray? {
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+
+        guard let array = try? MLMultiArray(
+            shape: [1, NSNumber(value: height), NSNumber(value: width), 3],
+            dataType: .float32
+        ) else { return nil }
+
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
+
+        // BGRA byte order on little-endian macOS.
+        // We convert to RGB and normalise to [0, 1].
+        let w = width
+        for y in 0..<height {
+            let rowStart = y * bytesPerRow
+            let arrayRowStart = y * w * 3
+            for x in 0..<width {
+                let pixelOffset = rowStart + x * 4
+                let b = Float(ptr[pixelOffset + 0])
+                let g = Float(ptr[pixelOffset + 1])
+                let r = Float(ptr[pixelOffset + 2])
+
+                let idx = arrayRowStart + x * 3
+                array[idx + 0] = NSNumber(value: r / 255.0)
+                array[idx + 1] = NSNumber(value: g / 255.0)
+                array[idx + 2] = NSNumber(value: b / 255.0)
+            }
+        }
+
+        return array
     }
 }
