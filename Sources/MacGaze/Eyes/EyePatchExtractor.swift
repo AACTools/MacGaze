@@ -31,6 +31,11 @@ public final class EyePatchExtractor {
     public static let patchWidth = 512
     public static let patchHeight = 128
 
+    /// Shared CIContext — creating one per call is expensive + can crash
+    /// Metal's command queue labeller under load.  One instance for the
+    /// lifetime of the extractor.
+    private let ciContext = CIContext()
+
     public init() {}
 
     /// Extract a 512×128 eye patch from a camera frame.
@@ -111,7 +116,6 @@ public final class EyePatchExtractor {
         guard cropRect.width > 10, cropRect.height > 10 else { return nil }
 
         // 4. Crop + resize via Core Image.
-        let ciContext = CIContext()
         let ciImage = CIImage(cvPixelBuffer: frame, options: nil)
         let cropped = ciImage.cropped(to: cropRect)
 

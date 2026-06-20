@@ -175,6 +175,11 @@ final class DebugPipeline: ObservableObject {
 
     // MARK: Rendering
 
+    /// Shared CIContext for rendering camera frames.  Creating a CIContext
+    /// per-frame crashes Metal (label race in setLabel:).  One shared
+    /// instance is the standard pattern and also much faster.
+    private static let sharedCIContext = CIContext()
+
     /// Convert a 32BGRA CVPixelBuffer to an NSImage for display.
     /// Mirrored horizontally to match the user's expectation (like
     /// Photo Booth) — the raw AVCapture front-camera feed is *not*
@@ -182,12 +187,14 @@ final class DebugPipeline: ObservableObject {
     private static func renderToNSImage(frame: CameraFrame) -> NSImage? {
         let buffer = frame.pixelBuffer
         let ciImage = CIImage(cvPixelBuffer: buffer)
-            .transformed(by: CGAffineTransform(scaleX: 1, y: -1))   // Vision uses bottom-left origin; flip for screen
+            .transformed(by: CGAffineTransform(scaleX: 1, y: -1))
             .transformed(by: CGAffineTransform(translationX: 0, y: CGFloat(frame.height)))
-            .transformed(by: CGAffineTransform(scaleX: -1, y: 1))   // mirror like a selfie
+            .transformed(by: CGAffineTransform(scaleX: -1, y: 1))
             .transformed(by: CGAffineTransform(translationX: CGFloat(frame.width), y: 0))
-        let context = CIContext()
-        guard let cg = context.createCGImage(ciImage, from: CGRect(x: 0, y: 0, width: frame.width, height: frame.height)) else {
+        guard let cg = sharedCIContext.createCGImage(
+            ciImage,
+            from: CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
+        ) else {
             return nil
         }
         return NSImage(cgImage: cg, size: NSSize(width: frame.width, height: frame.height))
