@@ -36,3 +36,11 @@ Data/Evaluation/*/
 # Converted model artifacts (large)
 Sources/MacGaze/Gaze/*.mlmodelc
 *.mlpackage
+
+# MediaPipe native library (48MB, not redistributable via git)
+Frameworks/libmediapipe.dylib
+Frameworks/face_landmarker.task
+
+# Get via:
+#   cp ../macgaze/Tools/Conversion/.venv/lib/python3.13/site-packages/mediapipe/tasks/c/libmediapipe.dylib Frameworks/
+#   cp ../macgaze/Tools/Conversion/WebEyeTrack-upstream/python/webeyetrack/model_weights/face_landmarker_v2_with_blendshapes.task Frameworks/
