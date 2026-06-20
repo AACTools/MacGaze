@@ -20,6 +20,14 @@ xcuserdata/
 # Forward-facing docs live in README.md at the root.
 docs/
 
+# WebEyeTrack upstream clone — local inspection only.
+# Re-clone with: git clone --depth=1 https://github.com/RedForestAI/WebEyeTrack.git
+Tools/Conversion/WebEyeTrack-upstream/
+
+# Python venvs for conversion scripts
+.venv/
+venv/
+
 # Evaluation data (large, not for redistribution)
 Data/Evaluation/External/
 Data/Evaluation/*/
