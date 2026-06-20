@@ -1,0 +1,24 @@
+# Build artifacts
+.build/
+.swiftpm/
+Package.resolved
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+
+# macOS
+.DS_Store
+._*
+
+# Internal thinking docs — kept locally, not committed.
+# Forward-facing docs live in README.md at the root.
+docs/
+
+# Evaluation data (large, not for redistribution)
+Data/Evaluation/External/
+Data/Evaluation/*/
+!Data/Evaluation/.gitkeep
+
+# Converted model artifacts (large)
+Sources/MacGaze/Gaze/*.mlmodelc
+*.mlpackage
