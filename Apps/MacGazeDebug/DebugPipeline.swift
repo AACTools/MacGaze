@@ -28,6 +28,7 @@ final class DebugPipeline: ObservableObject {
     let camera = CameraCapture()
     private let detector = FaceLandmarkDetector()
     private let eyePatchExtractor = EyePatchExtractor()
+    private let headPose = HeadPoseEstimator()
     private var blazeGaze: BlazeGazeRunner?
 
     private var captureTask: Task<Void, Never>?
@@ -113,8 +114,41 @@ final class DebugPipeline: ObservableObject {
             faceObservation: vnFace
         ) else { return nil }
 
-        // Run inference with neutral head pose (Phase 2.3 will fix this).
-        return blazeGaze?.predict(eyePatch: eyePatch)
+        // Solve head pose from Vision landmarks for BlazeGaze's
+        // head_vector + face_origin_3d inputs.
+        var headVector: MLMultiArray? = nil
+        var faceOrigin: MLMultiArray? = nil
+        if let pose = headPose.estimate(
+            face: vnFace,
+            frameWidth: frame.width,
+            frameHeight: frame.height
+        ) {
+            headVector = try? MLMultiArray(
+                shape: [1, 3],
+                dataType: .float32
+            )
+            faceOrigin = try? MLMultiArray(
+                shape: [1, 3],
+                dataType: .float32
+            )
+            if let hv = headVector {
+                hv[0] = NSNumber(value: pose.headVector[0])
+                hv[1] = NSNumber(value: pose.headVector[1])
+                hv[2] = NSNumber(value: pose.headVector[2])
+            }
+            if let fo = faceOrigin {
+                fo[0] = NSNumber(value: pose.faceOrigin3D[0])
+                fo[1] = NSNumber(value: pose.faceOrigin3D[1])
+                fo[2] = NSNumber(value: pose.faceOrigin3D[2])
+            }
+        }
+
+        // Run inference with solved (or neutral) head pose.
+        return blazeGaze?.predict(
+            eyePatch: eyePatch,
+            headVector: headVector,
+            faceOrigin3D: faceOrigin
+        )
     }
 
     // MARK: Stats
