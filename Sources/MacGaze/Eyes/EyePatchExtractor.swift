@@ -1,54 +1,27 @@
 import Foundation
 import CoreVideo
-import CoreImage
-import CoreImage.CIFilterBuiltins
+import Accelerate
 import Vision
 import GazeBridgeCore
 
-/// Extracts a 128×512×3 eye-region crop from a camera frame, suitable as
-/// input to the BlazeGaze CoreML model.
+/// Extracts a 128×512×3 eye-region crop from a camera frame using vImage
+/// (Accelerate framework, pure CPU — no Metal, no CIContext).
 ///
-/// The original WebEyeTrack implementation (`obtain_eyepatch()` in
-/// `model_based.py`) uses MediaPipe's 468-point landmarks to compute a
-/// perspective homography that maps the face to a canonical square, then
-/// crops the eye band. We approximate this with Apple Vision landmarks:
-///
-/// 1. Use the face bounding box from Vision to define the overall face region.
-/// 2. Use the left/right eye landmark regions to find the vertical extent
-///    of the eye band.
-/// 3. Crop the eye band from the camera frame.
-/// 4. Resize to 512×128 (width × height) via Core Image.
-/// 5. Normalise to float32 [0, 1].
-///
-/// This is **not** perspective-corrected like the Python version. We rely
-/// on BlazeGaze's internal head_vector + face_origin_3d inputs to compensate
-/// for head pose. If accuracy suffers, Phase 2.3 will add the full
-/// homography-based crop.
+/// Replaces the CIImage-based version which crashed due to a Metal
+/// telemetry race with macOS's Portrait/VFX camera effects system.
 public final class EyePatchExtractor {
 
-    /// Target eye-patch dimensions expected by BlazeGaze.
-    /// Order is (width, height) to match Core Image convention.
     public static let patchWidth = 512
     public static let patchHeight = 128
 
-    /// CPU-only CIContext — avoids Metal entirely to prevent a race
-    /// condition with the macOS Portrait/VFX camera effects system
-    /// which initializes its own Metal context concurrently when the
-    /// camera starts.  CPU rendering is fast enough for 512×128 crop +
-    /// resize at 30 fps.
-    private let ciContext = CIContext(options: [
-        .useSoftwareRenderer: true,
-        .priorityRequestLow: true,
-    ])
-
     public init() {}
 
-    /// Extract a 512×128 eye patch from a camera frame.
+    /// Extract a 512×128 eye patch from a camera frame using vImage.
     ///
     /// - Parameters:
     ///   - frame: The raw camera pixel buffer (1280×720 32BGRA).
     ///   - faceObservation: Vision's face landmark observation.
-    /// - Returns: A `CVPixelBuffer` containing the normalised eye patch,
+    /// - Returns: A `CVPixelBuffer` containing the eye patch in 32BGRA,
     ///            or `nil` if the face or eye landmarks can't be resolved.
     public func extract(
         frame: CVPixelBuffer,
@@ -57,18 +30,15 @@ public final class EyePatchExtractor {
         let frameWidth = CVPixelBufferGetWidth(frame)
         let frameHeight = CVPixelBufferGetHeight(frame)
 
-        // 1. Convert the face bounding box from Vision's normalised
-        //    (bottom-left origin) to pixel coordinates (top-left origin).
-        let faceBox = faceObservation.boundingBox  // normalised, bottom-left
+        // 1. Determine the eye-band region from Vision landmarks.
+        let faceBox = faceObservation.boundingBox
         let faceRect = CGRect(
             x: faceBox.minX * CGFloat(frameWidth),
-            y: (1 - faceBox.maxY) * CGFloat(frameHeight),  // flip Y
+            y: (1 - faceBox.maxY) * CGFloat(frameHeight),
             width: faceBox.width * CGFloat(frameWidth),
             height: faceBox.height * CGFloat(frameHeight)
         )
 
-        // 2. Determine the eye-band vertical extent from eye landmark
-        //    regions. If absent, fall back to the top 35% of the face box.
         var eyeBandTopY: CGFloat
         var eyeBandBottomY: CGFloat
 
@@ -77,9 +47,6 @@ public final class EyePatchExtractor {
            leftEye.pointCount > 0,
            rightEye.pointCount > 0 {
 
-            // Find the vertical extent of both eye regions combined.
-            // Vision reports points in normalised image coordinates with
-            // origin bottom-left.
             var minY: CGFloat = .infinity
             var maxY: CGFloat = -.infinity
             for region in [leftEye, rightEye] {
@@ -89,27 +56,19 @@ public final class EyePatchExtractor {
                     maxY = max(maxY, CGFloat(p.y))
                 }
             }
-            // Expand vertically: include eyebrows above and cheek below.
             let eyeHeight = maxY - minY
-            let expandUp: CGFloat = eyeHeight * 1.5     // eyebrows + forehead
-            let expandDown: CGFloat = eyeHeight * 2.0   // nose bridge + cheek
-
-            // Convert to pixel coordinates (flip Y).
+            let expandUp: CGFloat = eyeHeight * 1.5
+            let expandDown: CGFloat = eyeHeight * 2.0
             eyeBandTopY = (1 - min(CGFloat(1), maxY + expandUp)) * CGFloat(frameHeight)
             eyeBandBottomY = (1 - max(CGFloat(0), minY - expandDown)) * CGFloat(frameHeight)
         } else {
-            // Fallback: top 35% of the face bounding box.
             eyeBandTopY = faceRect.minY
             eyeBandBottomY = faceRect.minY + faceRect.height * 0.35
         }
 
-        // Clamp to frame bounds.
         eyeBandTopY = max(0, min(CGFloat(frameHeight), eyeBandTopY))
         eyeBandBottomY = max(0, min(CGFloat(frameHeight), eyeBandBottomY))
 
-        // 3. Build the crop rectangle: full face width + eye-band height.
-        //    Expand horizontally by 10% on each side to capture the full
-        //    eye region including temple area.
         let hExpand = faceRect.width * 0.1
         let cropRect = CGRect(
             x: max(0, faceRect.minX - hExpand),
@@ -120,16 +79,49 @@ public final class EyePatchExtractor {
 
         guard cropRect.width > 10, cropRect.height > 10 else { return nil }
 
-        // 4. Crop + resize via Core Image.
-        let ciImage = CIImage(cvPixelBuffer: frame, options: nil)
-        let cropped = ciImage.cropped(to: cropRect)
+        // 2. Use vImage to crop + resize.  Pure CPU, no Metal.
+        return vImageCropAndResize(
+            frame: frame,
+            cropRect: cropRect,
+            destWidth: Self.patchWidth,
+            destHeight: Self.patchHeight
+        )
+    }
 
-        // Create a scale filter to resize to the target dimensions.
-        let scaleX = CGFloat(Self.patchWidth) / cropRect.width
-        let scaleY = CGFloat(Self.patchHeight) / cropRect.height
-        let resized = cropped.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+    /// Crop + resize a CVPixelBuffer using vImage (Accelerate).
+    /// Returns a new 32BGRA pixel buffer.
+    private func vImageCropAndResize(
+        frame: CVPixelBuffer,
+        cropRect: CGRect,
+        destWidth: Int,
+        destHeight: Int
+    ) -> CVPixelBuffer? {
+        CVPixelBufferLockBaseAddress(frame, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(frame, .readOnly) }
 
-        // 5. Render to a new pixel buffer.
+        guard let baseAddress = CVPixelBufferGetBaseAddress(frame) else { return nil }
+        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(frame)
+
+        let cropX = Int(cropRect.origin.x)
+        let cropY = Int(cropRect.origin.y)
+        let cropW = Int(cropRect.width)
+        let cropH = Int(cropRect.height)
+
+        guard cropW > 0, cropH > 0,
+              cropX + cropW <= CVPixelBufferGetWidth(frame),
+              cropY + cropH <= CVPixelBufferGetHeight(frame) else { return nil }
+
+        // Source vImage buffer: pointer into the crop region of the frame.
+        // BGRA format = ARGB8888 in vImage (channel order depends on endianness).
+        let cropBase = baseAddress.advanced(by: cropY * srcBytesPerRow + cropX * 4)
+        var srcBuffer = vImage_Buffer(
+            data: cropBase,
+            height: vImagePixelCount(cropH),
+            width: vImagePixelCount(cropW),
+            rowBytes: srcBytesPerRow
+        )
+
+        // Destination buffer.
         var outputBuffer: CVPixelBuffer?
         let attrs: [CFString: Any] = [
             kCVPixelBufferCGImageCompatibilityKey: true,
@@ -137,15 +129,30 @@ public final class EyePatchExtractor {
         ]
         let status = CVPixelBufferCreate(
             kCFAllocatorDefault,
-            Self.patchWidth,
-            Self.patchHeight,
+            destWidth, destHeight,
             kCVPixelFormatType_32BGRA,
             attrs as CFDictionary,
             &outputBuffer
         )
         guard status == kCVReturnSuccess, let outputBuffer else { return nil }
 
-        ciContext.render(resized, to: outputBuffer)
+        CVPixelBufferLockBaseAddress(outputBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(outputBuffer, []) }
+
+        guard let destBase = CVPixelBufferGetBaseAddress(outputBuffer) else { return nil }
+        let destBytesPerRow = CVPixelBufferGetBytesPerRow(outputBuffer)
+        var destBuffer = vImage_Buffer(
+            data: destBase,
+            height: vImagePixelCount(destHeight),
+            width: vImagePixelCount(destWidth),
+            rowBytes: destBytesPerRow
+        )
+
+        // Scale BGRA8888.  vImage uses ARGB channel order on little-endian
+        // which matches BGRA byte order.
+        let scaleError = vImageScale_ARGB8888(&srcBuffer, &destBuffer, nil, vImage_Flags(kvImageEdgeExtend))
+        guard scaleError == kvImageNoError else { return nil }
+
         return outputBuffer
     }
 }

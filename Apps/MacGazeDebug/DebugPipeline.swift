@@ -175,30 +175,61 @@ final class DebugPipeline: ObservableObject {
 
     // MARK: Rendering
 
-    /// CPU-only CIContext for rendering camera frames.  Avoids Metal to
-    /// prevent a race with the macOS Portrait/VFX effects system.
-    private static let sharedCIContext = CIContext(options: [
-        .useSoftwareRenderer: true,
-        .priorityRequestLow: true,
-    ])
-
     /// Convert a 32BGRA CVPixelBuffer to an NSImage for display.
-    /// Mirrored horizontally to match the user's expectation (like
-    /// Photo Booth) — the raw AVCapture front-camera feed is *not*
-    /// automatically mirrored at the buffer level.
+    /// Uses pure CoreGraphics (no CIContext / Metal) to avoid the
+    /// Portrait/VFX camera effects Metal race.
+    /// Mirrored horizontally for selfie view.
     private static func renderToNSImage(frame: CameraFrame) -> NSImage? {
         let buffer = frame.pixelBuffer
-        let ciImage = CIImage(cvPixelBuffer: buffer)
-            .transformed(by: CGAffineTransform(scaleX: 1, y: -1))
-            .transformed(by: CGAffineTransform(translationX: 0, y: CGFloat(frame.height)))
-            .transformed(by: CGAffineTransform(scaleX: -1, y: 1))
-            .transformed(by: CGAffineTransform(translationX: CGFloat(frame.width), y: 0))
-        guard let cg = sharedCIContext.createCGImage(
-            ciImage,
-            from: CGRect(x: 0, y: 0, width: frame.width, height: frame.height)
-        ) else {
-            return nil
-        }
-        return NSImage(cgImage: cg, size: NSSize(width: frame.width, height: frame.height))
+        let width = frame.width
+        let height = frame.height
+
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+        // Create CGImage directly from raw BGRA pixels (no CIContext).
+        guard let provider = CGDataProvider(
+            dataInfo: nil,
+            data: baseAddress,
+            size: height * bytesPerRow,
+            releaseData: { _, _, _ in }
+        ) else { return nil }
+
+        guard let cgImage = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(
+                rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue
+                  | CGBitmapInfo.byteOrder32Little.rawValue
+            ),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ) else { return nil }
+
+        // Mirror X (selfie view) via CGContext.
+        guard let ctx = CGContext(
+            data: nil, width: width, height: height,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+              | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return nil }
+
+        ctx.translateBy(x: CGFloat(width), y: 0)
+        ctx.scaleBy(x: -1, y: 1)
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        guard let mirrored = ctx.makeImage() else { return nil }
+        return NSImage(cgImage: mirrored, size: NSSize(width: width, height: height))
     }
 }
