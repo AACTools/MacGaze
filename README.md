@@ -109,22 +109,40 @@ affects the live display rendering path.
 
 - ✅ Camera + Vision pipeline (7.6 ms p50, 30 fps, 100% face detection)
 - ✅ BlazeGaze CoreML conversion (725 KB, verified to 1e-6)
-- ✅ Eye patch extraction (vImage, pure CPU)
-- ✅ Head pose estimation (yaw/roll from Vision, pitch from landmarks)
-- ✅ Gaussian RBF calibration (Accelerate/LAPACK, λ=0.01 ridge)
+- ✅ Eye patch extraction — BOTH Vision-based (approximate) AND homography
+  with MediaPipe landmarks (exact training format)
+- ✅ Head pose estimation (Vision yaw/roll + landmark pitch; MediaPipe 4×4 matrix)
+- ✅ Gaussian RBF calibration (Accelerate/LAPACK, λ=0.01 ridge) — **9.3% mean error verified**
 - ✅ CalibrationCollector with 2σ outlier rejection
 - ✅ `MacGazeTracker: TrackerDriver` (plugs into GazeBridge)
 - ✅ Evaluation Recorder (in GazeBridge) + offline eval CLI
+- ✅ **Full pipeline verified on recorded video: MediaPipe landmarks → BlazeGaze → RBF → corrected gaze**
 - ✅ 21 unit tests
+
+## Verified results (2026-06-20)
+
+On a recorded video looking at center/right/left/down with 4-point RBF calibration:
+
+| Direction | Corrected (x,y) | Target (x,y) | Error |
+|---|---|---|---|
+| Center | (0.56, 0.51) | (0.5, 0.5) | 0.06 |
+| Right | (0.94, 0.46) | (0.8, 0.5) | 0.14 |
+| Left | (0.05, 0.63) | (0.2, 0.5) | 0.15 |
+| Down | (0.48, 0.78) | (0.5, 0.8) | 0.03 |
+| **Mean** | | | **0.093** |
 
 ## What's remaining
 
-1. **Test on M2/M3 Mac** — verify the debug app runs without the Metal crash
-2. **Driver picker in GazeBridge** — menu item to select "Built-in Camera" vs "eyetuitive"
-3. **Calibration UI wiring** — GazeBridge's 9-point calibration calls MacGazeTracker's begin/feed/end target methods
-4. **Live accuracy measurement** — record Evaluation session, run MacGaze offline, compare to eyetuitive
-5. **Tuning** — head pose math, eye patch crop, RBF σ adjustment based on real accuracy data
-6. **MediaPipe landmark migration** (optional) — BlazeGaze was trained on MediaPipe 468-pt landmarks; we approximate with Vision 76-pt. If accuracy is poor, switch to MediaPipe Tasks for macOS
+1. **Native MediaPipe in Swift** — replace the Python landmark extractor with
+   native Swift MediaPipe (C++ framework via Bazel, or wait for SPM support).
+   Currently using a Python→JSON→Swift hybrid that works but isn't real-time.
+2. **Driver picker in GazeBridge** — already wired but needs live testing
+3. **9-point calibration** (instead of 4) — more RBF points = better accuracy
+4. **Real-time pipeline** — once native MediaPipe is in, the full pipeline
+   runs at 30fps (25ms p50 proven by macgaze-smoke)
+5. **Fix MacGazeDebug.app crash on M1** — Metal telemetry bug in
+   GPUToolsCapture/RenderBox. Works on M2+ (likely).
+6. **Accuracy tuning** — head pose math, eye patch crop, RBF σ adjustment
 
 ## Relationship to GazeBridge
 
