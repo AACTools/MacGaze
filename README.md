@@ -33,13 +33,15 @@ CVPixelBuffer
 ```sh
 git clone https://github.com/AACTools/MacGaze.git
 cd MacGaze
-chmod +x scripts/setup.sh
 ./scripts/setup.sh
 ```
 
-This handles: BlazeGaze model conversion, MediaPipe native library,
-Python venv setup, Xcode project generation. See [TESTING.md](TESTING.md)
-for the full test checklist.
+That's it. The script downloads pre-built binary assets (BlazeGaze CoreML
+model, MediaPipe native library) from the [GitHub
+release](https://github.com/AACTools/MacGaze/releases/tag/v0.1.0-assets),
+builds the package, runs tests, and generates the Xcode project.
+
+No Python, no model conversion, no manual file copying needed.
 
 Requires macOS 15+, Xcode 16+, Apple Silicon.
 
@@ -116,39 +118,19 @@ MacGaze/
 
 ## Setup details
 
-The `./scripts/setup.sh` script handles:
+The `./scripts/setup.sh` script downloads pre-built assets from the
+[GitHub release](https://github.com/AACTools/MacGaze/releases/tag/v0.1.0-assets):
 
-1. Builds the Swift package (verifies GazeBridgeCore dependency)
-2. Converts BlazeGaze Keras → CoreML (needs Python + tensorflow + coremltools)
-3. Copies `libmediapipe.dylib` from the Python `mediapipe` package
-4. Downloads the MediaPipe `face_landmarker.task` model
-5. Runs unit tests
-6. Generates the Xcode project
+| Asset | Size | Source | License |
+|---|---|---|---|
+| `blazegaze.mlmodelc.zip` | 577 KB | Converted from WebEyeTrack (MIT) | MIT |
+| `libmediapipe.dylib` | 48 MB | From Python `mediapipe` package | Apache 2.0 |
+| `face_landmarker_v2_with_blendshapes.task` | 3.6 MB | Google MediaPipe models | Apache 2.0 |
 
-**Manual setup** (if the script fails):
-
-```sh
-# 1. Clone WebEyeTrack for the BlazeGaze model
-cd Tools/Conversion
-git clone --depth=1 https://github.com/RedForestAI/WebEyeTrack.git WebEyeTrack-upstream
-
-# 2. Set up Python venv
-python3 -m venv .venv
-.venv/bin/pip install tensorflow coremltools mediapipe
-
-# 3. Convert BlazeGaze model
-.venv/bin/python convert_blazegaze.py
-cd ../..
-xcrun coremlc compile Sources/MacGaze/Gaze/blazegaze.mlpackage Sources/MacGaze/Gaze
-
-# 4. Copy MediaPipe native library
-mkdir -p Frameworks
-cp Tools/Conversion/.venv/lib/python*/site-packages/mediapipe/tasks/c/libmediapipe.dylib Frameworks/
-cp Tools/Conversion/WebEyeTrack-upstream/python/webeyetrack/model_weights/face_landmarker_v2_with_blendshapes.task Frameworks/
-
-# 5. Generate Xcode project
-xcodegen generate
-```
+The BlazeGaze model can be regenerated from source via the
+`.github/workflows/build-assets.yml` GitHub Actions workflow (triggers on
+tag push). The conversion script (`Tools/Conversion/convert_blazegaze.py`)
+is kept for reproducibility but is not needed for normal use.
 
 ## Known issues
 
