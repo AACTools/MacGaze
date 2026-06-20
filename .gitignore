@@ -3,8 +3,14 @@
 .swiftpm/
 Package.resolved
 DerivedData/
+build/
+# Xcode project is regenerated via `xcodegen generate`; don't commit it.
 *.xcodeproj
 *.xcworkspace
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.playground/
 
 # macOS
 .DS_Store

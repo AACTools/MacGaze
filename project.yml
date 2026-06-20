@@ -1,0 +1,57 @@
+name: MacGazeDebug
+options:
+  bundleIdPrefix: com.macgaze
+  deploymentTarget:
+    macOS: "15.0"
+  developmentLanguage: en
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+
+packages:
+  MacGaze:
+    path: .
+
+targets:
+  MacGazeDebug:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Apps/MacGazeDebug
+    info:
+      path: Apps/MacGazeDebug/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: MacGaze Debug
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundlePackageType: APPL
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundleVersion: 1
+        CFBundleShortVersionString: "0.1.0"
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        LSUIElement: false
+        LSApplicationCategoryType: public.app-category.developer-tools
+        NSHumanReadableCopyright: "© 2026 MacGaze contributors"
+        NSCameraUsageDescription: "MacGaze Debug uses the camera to test the software eye-tracker pipeline. No video leaves your device."
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.macgaze.debug
+        PRODUCT_NAME: MacGazeDebug
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_PREVIEWS: YES
+        DEAD_CODE_STRIPPING: YES
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+    dependencies:
+      - package: MacGaze
+        product: MacGaze
