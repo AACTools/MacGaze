@@ -132,6 +132,37 @@ The BlazeGaze model can be regenerated from source via the
 tag push). The conversion script (`Tools/Conversion/convert_blazegaze.py`)
 is kept for reproducibility but is not needed for normal use.
 
+### Manual build from source (optional)
+
+If you want to build the assets yourself instead of downloading the
+pre-built release:
+
+```sh
+# 1. Clone WebEyeTrack for the BlazeGaze model
+cd Tools/Conversion
+git clone --depth=1 https://github.com/RedForestAI/WebEyeTrack.git WebEyeTrack-upstream
+
+# 2. Set up Python venv
+python3 -m venv .venv
+.venv/bin/pip install tensorflow coremltools mediapipe
+
+# 3. Convert BlazeGaze model
+.venv/bin/python convert_blazegaze.py
+cd ../..
+xcrun coremlc compile Sources/MacGaze/Gaze/blazegaze.mlpackage Sources/MacGaze/Gaze
+
+# 4. Copy MediaPipe native library + model
+mkdir -p Frameworks
+cp Tools/Conversion/.venv/lib/python*/site-packages/mediapipe/tasks/c/libmediapipe.dylib Frameworks/
+cp Tools/Conversion/WebEyeTrack-upstream/python/webeyetrack/model_weights/face_landmarker_v2_with_blendshapes.task Frameworks/
+
+# 5. Generate Xcode project
+xcodegen generate
+```
+
+This is also what the CI workflow (`.github/workflows/build-assets.yml`)
+does automatically on tag push.
+
 ## Known issues
 
 1. **MacGazeDebug.app crashes on some M1 Macs** — Metal telemetry bug in
