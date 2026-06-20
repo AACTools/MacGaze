@@ -118,8 +118,30 @@ struct DebugWindow: View {
                     .font(.callout)
             }
 
+            Divider()
+
+            // BlazeGaze gaze prediction section.
+            Text("BlazeGaze").font(.headline)
+            if let gaze = pipeline.gazePrediction {
+                statRow("Gaze (x, y)") {
+                    Text(String(format: "(%.3f, %.3f)", gaze.x, gaze.y))
+                        .monospacedDigit()
+                }
+                statRow("Inference") {
+                    Text(String(format: "%.1f ms", pipeline.gazeLatencyMs))
+                        .monospacedDigit()
+                        .foregroundStyle(pipeline.gazeLatencyMs < 10 ? .green : .orange)
+                }
+            } else {
+                statRow("Gaze") {
+                    Text(pipeline.latestDetection?.stats.faceFound == true
+                         ? "Model loading…" : "No face")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Spacer()
-            Text("MacGaze Debug · Phase 0")
+            Text("MacGaze Debug · Phase 2")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }

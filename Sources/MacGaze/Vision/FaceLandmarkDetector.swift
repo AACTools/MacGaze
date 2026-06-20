@@ -17,6 +17,11 @@ import Vision
 /// per-frame but the request object is cheap to keep around.
 public final class FaceLandmarkDetector: @unchecked Sendable {
 
+    /// The raw `VNFaceObservation` from the most recent successful detect()
+    /// call.  Consumers that need the full Vision landmark regions (e.g.
+    /// EyePatchExtractor) can read this instead of carrying their own copy.
+    public private(set) var lastRawObservation: VNFaceObservation?
+
     public struct Configuration: Sendable {
         /// Vision frame-region-of-interest in normalized image coords.
         /// `nil` = whole frame.  Useful for focusing on a sub-region in
@@ -61,6 +66,7 @@ public final class FaceLandmarkDetector: @unchecked Sendable {
         }
 
         guard let face = request.results?.first else {
+            self.lastRawObservation = nil
             return DetectionResult(
                 observation: nil,
                 stats: DetectionStats(
@@ -69,6 +75,8 @@ public final class FaceLandmarkDetector: @unchecked Sendable {
                 )
             )
         }
+
+        self.lastRawObservation = face
 
         let observation = FaceObservation(
             boundingBox: face.boundingBox,

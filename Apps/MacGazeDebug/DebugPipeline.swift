@@ -3,16 +3,19 @@ import AVFoundation
 import AppKit
 import QuartzCore
 import Combine
+import Vision
 import MacGaze
 
-/// Drives the CameraCapture + FaceLandmarkDetector pipeline for the
-/// debug window.  All Vision work happens off the main actor; only the
-/// @Published final results land on it.
+/// Drives the CameraCapture + FaceLandmarkDetector + BlazeGaze pipeline
+/// for the debug window.  All Vision + CoreML work happens off the main
+/// actor; only the @Published final results land on it.
 @MainActor
 final class DebugPipeline: ObservableObject {
 
     @Published private(set) var latestImage: NSImage?
     @Published private(set) var latestDetection: DetectionResult?
+    @Published private(set) var gazePrediction: CGPoint?      // BlazeGaze output
+    @Published private(set) var gazeLatencyMs: Double = 0     // BlazeGaze inference time
     @Published private(set) var sessionState: SessionState = .idle
     @Published private(set) var framesPerSecond: Double = 0
     @Published private(set) var medianLatencyMs: Double = 0
@@ -24,11 +27,13 @@ final class DebugPipeline: ObservableObject {
 
     let camera = CameraCapture()
     private let detector = FaceLandmarkDetector()
+    private let eyePatchExtractor = EyePatchExtractor()
+    private var blazeGaze: BlazeGazeRunner?
 
     private var captureTask: Task<Void, Never>?
     private var frameCount: Int = 0
     private var lastFpsTick = Date()
-    private var recentLatencies: [Double] = []  // ring buffer, last 30 samples
+    private var recentLatencies: [Double] = []
     private let maxLatencySamples = 30
 
     func start() {
@@ -57,23 +62,59 @@ final class DebugPipeline: ObservableObject {
             return
         }
 
-        // Frame + detection happen on the AVCapture video queue.  We
-        // marshal results back to MainActor for @Published state.
+        // Frame + detection + BlazeGaze happen on the AVCapture video queue.
+        // We marshal results back to MainActor for @Published state.
         let stream = camera.frames
         for await frame in stream {
-            // Run Vision synchronously — it locks the pixelBuffer for
-            // the duration, so we must finish before awaiting the next
-            // frame.  Off-main because we're on the AVCapture video queue.
+            // 1. Vision landmark detection.
             let detection = detector.detect(frame)
+
+        // 2. BlazeGaze gaze prediction (if face found + model loaded).
+        var gaze: CGPoint? = nil
+        var gazeMs: Double = 0
+        if detection.stats.faceFound,
+           let vnFace = detector.lastRawObservation {
+            let t0 = Date()
+            gaze = runBlazeGaze(frame: frame, vnFace: vnFace)
+            gazeMs = Date().timeIntervalSince(t0) * 1000
+        }
+
             let image = Self.renderToNSImage(frame: frame)
 
             await MainActor.run {
                 self.latestImage = image
                 self.latestDetection = detection
+                self.gazePrediction = gaze
+                self.gazeLatencyMs = gazeMs
                 self.recordLatency(detection.stats.latencyMs)
                 self.tickFps()
             }
         }
+    }
+
+    /// Run BlazeGaze inference on the current frame.  Returns nil if the
+    /// model isn't loaded or prediction fails.
+    private func runBlazeGaze(frame: CameraFrame, vnFace: VNFaceObservation) -> CGPoint? {
+        // Ensure the model is loaded (lazy init on first call).
+        if blazeGaze == nil {
+            do {
+                blazeGaze = try BlazeGazeRunner()
+            } catch {
+                // Model not found — BlazeGaze stays nil; pipeline falls back
+                // to landmark-only display.  Silently fail rather than spam
+                // the user every frame.
+                return nil
+            }
+        }
+
+        // Extract the eye patch from the camera frame.
+        guard let eyePatch = eyePatchExtractor.extract(
+            frame: frame.pixelBuffer,
+            faceObservation: vnFace
+        ) else { return nil }
+
+        // Run inference with neutral head pose (Phase 2.3 will fix this).
+        return blazeGaze?.predict(eyePatch: eyePatch)
     }
 
     // MARK: Stats
