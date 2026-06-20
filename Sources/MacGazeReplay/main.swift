@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import CoreVideo
 import CoreML
+import ImageIO
 import MacGaze
 
 /// Headless pipeline test — replays a recorded video through the full
@@ -39,6 +40,9 @@ struct MacGazeReplay {
         }
         let filePath = args[1]
         let verbose = args.contains("--verbose")
+        let dumpPatches = args.contains("--dump-patches")
+        let dumpDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("patch-dump")
 
         let url = URL(fileURLWithPath: filePath)
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -69,7 +73,8 @@ struct MacGazeReplay {
                                headPose: headPose, blazeGaze: blazeGaze, verbose: verbose)
         } else {
             await processVideo(url: url, detector: detector, extractor: eyePatchExtractor,
-                               headPose: headPose, blazeGaze: blazeGaze, verbose: verbose)
+                               headPose: headPose, blazeGaze: blazeGaze, verbose: verbose,
+                               dumpPatches: dumpPatches, dumpDir: dumpDir)
         }
     }
 
@@ -77,8 +82,9 @@ struct MacGazeReplay {
     Usage: macgaze-replay <video-or-image-file> [options]
 
     Options:
-      --verbose    Print per-frame gaze + latency.
-      -h, --help   Show this help.
+      --verbose        Print per-frame gaze + latency.
+      --dump-patches   Save first 10 eye patches as PNGs to ./patch-dump/.
+      -h, --help       Show this help.
 
     Record a test video with QuickTime looking at 5 screen positions
     (center, left, right, up, down) for ~2s each. Save as .mov or .mp4.
@@ -92,7 +98,9 @@ struct MacGazeReplay {
         extractor: EyePatchExtractor,
         headPose: HeadPoseEstimator,
         blazeGaze: BlazeGazeRunner,
-        verbose: Bool
+        verbose: Bool,
+        dumpPatches: Bool = false,
+        dumpDir: URL = URL(fileURLWithPath: ".")
     ) async {
         let asset = AVURLAsset(url: url)
         guard let track = asset.tracks(withMediaType: .video).first else {
@@ -162,6 +170,16 @@ struct MacGazeReplay {
                             print("  [debug] frame \(frameIndex): eye patch extraction FAILED")
                         }
                         continue
+                    }
+
+                    // Dump eye patch as PNG for visual inspection.
+                    if dumpPatches && frameIndex <= 10 {
+                        if !FileManager.default.fileExists(atPath: dumpDir.path) {
+                            try? FileManager.default.createDirectory(at: dumpDir, withIntermediateDirectories: true)
+                        }
+                        let pngURL = dumpDir.appendingPathComponent("patch_\(String(format: "%04d", frameIndex)).png")
+                        Self.savePixelBufferAsPNG(eyePatch, to: pngURL)
+                        print("  [dump] saved \(pngURL.lastPathComponent)")
                     }
 
                     if verbose && frameIndex <= 3 {
@@ -302,5 +320,48 @@ struct MacGazeReplay {
             return cg
         }
         return nil
+    }
+
+    /// Save a CVPixelBuffer as a PNG file (pure CoreGraphics, no Metal).
+    private static func savePixelBufferAsPNG(_ buffer: CVPixelBuffer, to url: URL) {
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else { return }
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+        guard let provider = CGDataProvider(
+            dataInfo: nil,
+            data: baseAddress,
+            size: height * bytesPerRow,
+            releaseData: { _, _, _ in }
+        ) else { return }
+
+        guard let cgImage = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(
+                rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue
+                  | CGBitmapInfo.byteOrder32Little.rawValue
+            ),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ) else { return }
+
+        guard let dest = CGImageDestinationCreateWithURL(
+            url as CFURL, "public.png" as CFString, 1, nil
+        ) else { return }
+        CGImageDestinationAddImage(dest, cgImage, nil)
+        CGImageDestinationFinalize(dest)
     }
 }
