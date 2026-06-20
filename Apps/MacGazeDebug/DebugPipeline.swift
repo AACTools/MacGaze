@@ -33,7 +33,9 @@ final class DebugPipeline: ObservableObject {
 
     private var captureTask: Task<Void, Never>?
     private var frameCount: Int = 0
+    private var displayFrameCount: Int = 0
     private var lastFpsTick = Date()
+    private var lastDisplayTime: Date = .distantPast
     private var recentLatencies: [Double] = []
     private let maxLatencySamples = 30
 
@@ -80,7 +82,14 @@ final class DebugPipeline: ObservableObject {
             gazeMs = Date().timeIntervalSince(t0) * 1000
         }
 
-            let image = Self.renderToNSImage(frame: frame)
+            // Render display image at most 10 fps to reduce Metal load
+            // on Core Animation's display cycle.  The camera stream +
+            // BlazeGaze still runs at full 30 fps; only the NSImage
+            // display is throttled.
+            let now = Date()
+            let shouldDisplay = now.timeIntervalSince(lastDisplayTime) >= 0.1  // 10 fps
+            let image: NSImage? = shouldDisplay ? Self.renderToNSImage(frame: frame) : nil
+            if shouldDisplay { lastDisplayTime = now }
 
             await MainActor.run {
                 self.latestImage = image
