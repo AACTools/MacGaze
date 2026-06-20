@@ -109,20 +109,31 @@ struct MacGazeReplay {
         print("  BlazeGaze model: loaded")
         print("")
 
+        // Parse --native flag (use native MediaPipe dylib instead of JSON)
+        let useNative = args.contains("--native")
+        let nativeModelPath = "Frameworks/face_landmarker_v2_with_blendshapes.task"
+
+        if useNative {
+            print("  Using NATIVE MediaPipe (libmediapipe.dylib) — real-time path")
+        }
+
         if isImage {
             await processImage(url: url, detector: detector, extractor: eyePatchExtractor,
                                headPose: headPose, blazeGaze: blazeGaze, verbose: verbose)
+        } else if useNative {
+            await processVideoNativeMediaPipe(
+                url: url, blazeGaze: blazeGaze, verbose: verbose,
+                modelPath: nativeModelPath, calibWindows: calibWindows
+            )
+        } else if let lmData = landmarksData {
+            await processVideoMediaPipe(url: url, blazeGaze: blazeGaze,
+                                       verbose: verbose, landmarksData: lmData,
+                                       calibWindows: calibWindows)
         } else {
-            if let lmData = landmarksData {
-                await processVideoMediaPipe(url: url, blazeGaze: blazeGaze,
-                                           verbose: verbose, landmarksData: lmData,
-                                           calibWindows: calibWindows)
-            } else {
-                await processVideo(url: url, detector: detector, extractor: eyePatchExtractor,
-                                   headPose: headPose, blazeGaze: blazeGaze, verbose: verbose,
-                                   dumpPatches: dumpPatches, dumpDir: dumpDir,
-                                   calibWindows: calibWindows)
-            }
+            await processVideo(url: url, detector: detector, extractor: eyePatchExtractor,
+                               headPose: headPose, blazeGaze: blazeGaze, verbose: verbose,
+                               dumpPatches: dumpPatches, dumpDir: dumpDir,
+                               calibWindows: calibWindows)
         }
     }
 

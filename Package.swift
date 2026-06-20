@@ -18,8 +18,14 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CMediaPipe",
+            path: "Sources/CMediaPipe",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "MacGaze",
             dependencies: [
+                "CMediaPipe",
                 .product(name: "GazeBridgeCore", package: "gazebridge"),
             ],
             path: "Sources/MacGaze"
