@@ -11,17 +11,13 @@ import MacGaze
 /// No SwiftUI, no Core Animation, no Metal display = no crash on M1.
 ///
 /// Usage:
-///   swift run macgaze-replay <video-file>     [--verbose]
-///   swift run macgaze-replay <image-file>     [--verbose]
+///   swift run macgaze-replay <video-file> [--verbose] [--dump-patches]
+///   swift run macgaze-replay <video-file> --landmarks <landmarks.json>
+///   swift run macgaze-replay <video-file> --landmarks <landmarks.json> --calibrate "..."
 ///
-/// Record a video with QuickTime (File → New Movie Recording) looking
-/// at: center → left → right → up → down → center, ~2s each direction.
-/// Save as .mov or .mp4. Then:
-///
-///   swift run macgaze-replay ~/Desktop/my-gaze-test.mov
-///
-/// If the printed gaze (x,y) values track your eye movements, the
-/// pipeline works correctly.
+/// When --landmarks is provided, uses MediaPipe 478-point landmarks
+/// (extracted by extract_landmarks.py) instead of Apple Vision. This
+/// produces the exact input format BlazeGaze was trained on.
 
 @main
 struct MacGazeReplay {
@@ -75,6 +71,30 @@ struct MacGazeReplay {
         let ext = url.pathExtension.lowercased()
         let isImage = ["jpg", "jpeg", "png", "heic"].contains(ext)
 
+        // Parse --landmarks <json-file>
+        var landmarksData: [LandmarkFrame]? = nil
+        if let lmIdx = args.firstIndex(of: "--landmarks"), lmIdx + 1 < args.count {
+            let lmPath = args[lmIdx + 1]
+            if FileManager.default.fileExists(atPath: lmPath) {
+                if let data = try? Data(contentsOf: URL(fileURLWithPath: lmPath)),
+                   let decoded = try? JSONDecoder().decode([LandmarkFrame].self, from: data) {
+                    landmarksData = decoded
+                    print("Loaded \(decoded.count) frames of MediaPipe landmarks from \(URL(fileURLWithPath: lmPath).lastPathComponent)")
+                } else {
+                    fputs("warning: could not parse landmarks JSON, falling back to Vision\n", stderr)
+                }
+            } else {
+                fputs("warning: landmarks file not found: \(lmPath), falling back to Vision\n", stderr)
+            }
+        }
+
+        if landmarksData != nil {
+            print("  Using MediaPipe 478-pt landmarks + homography eye patch (exact training format)")
+        } else {
+            print("  Using Apple Vision landmarks (approximate)")
+        }
+        print("")
+
         // Load pipeline components.
         let detector = FaceLandmarkDetector()
         let eyePatchExtractor = EyePatchExtractor()
@@ -93,10 +113,16 @@ struct MacGazeReplay {
             await processImage(url: url, detector: detector, extractor: eyePatchExtractor,
                                headPose: headPose, blazeGaze: blazeGaze, verbose: verbose)
         } else {
-            await processVideo(url: url, detector: detector, extractor: eyePatchExtractor,
-                               headPose: headPose, blazeGaze: blazeGaze, verbose: verbose,
-                               dumpPatches: dumpPatches, dumpDir: dumpDir,
-                               calibWindows: calibWindows)
+            if let lmData = landmarksData {
+                await processVideoMediaPipe(url: url, blazeGaze: blazeGaze,
+                                           verbose: verbose, landmarksData: lmData,
+                                           calibWindows: calibWindows)
+            } else {
+                await processVideo(url: url, detector: detector, extractor: eyePatchExtractor,
+                                   headPose: headPose, blazeGaze: blazeGaze, verbose: verbose,
+                                   dumpPatches: dumpPatches, dumpDir: dumpDir,
+                                   calibWindows: calibWindows)
+            }
         }
     }
 
@@ -123,8 +149,14 @@ struct MacGazeReplay {
         verbose: Bool,
         dumpPatches: Bool = false,
         dumpDir: URL = URL(fileURLWithPath: "."),
-        calibWindows: [(start: Double, end: Double, targetX: Double, targetY: Double)] = []
+        calibWindows: [(start: Double, end: Double, targetX: Double, targetY: Double)] = [],
+        landmarksData: [LandmarkFrame]? = nil
     ) async {
+        let useMediaPipe = landmarksData != nil
+        var landmarkByFrame: [Int: LandmarkFrame] = [:]
+        if let landmarksData {
+            for lm in landmarksData { landmarkByFrame[lm.frame] = lm }
+        }
         let asset = AVURLAsset(url: url)
         guard let track = asset.tracks(withMediaType: .video).first else {
             fputs("error: no video track found\n", stderr)

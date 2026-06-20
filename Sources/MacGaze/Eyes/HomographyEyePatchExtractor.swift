@@ -4,20 +4,30 @@ import CoreVideo
 import Accelerate
 
 /// Codable model for the JSON output of `extract_landmarks.py`.
-struct LandmarkFrame: Codable {
-    let frame: Int
-    let timestampMs: Int
-    let width: Int
-    let height: Int
-    let landmarks: [[Double]]       // 478 × [x, y, z], normalized [0,1]
-    let faceTransform: [[Double]]?  // 4×4 matrix
+public struct LandmarkFrame: Codable {
+    public let frame: Int
+    public let timestampMs: Int
+    public let width: Int
+    public let height: Int
+    public let landmarks: [[Double]]
+    public let faceTransform: [[Double]]?
 
-    enum CodingKeys: String, CodingKey {
+    public enum CodingKeys: String, CodingKey {
         case frame
         case timestampMs = "timestamp_ms"
         case width, height
         case landmarks
         case faceTransform = "face_transform"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        frame = try c.decode(Int.self, forKey: .frame)
+        timestampMs = try c.decode(Int.self, forKey: .timestampMs)
+        width = try c.decode(Int.self, forKey: .width)
+        height = try c.decode(Int.self, forKey: .height)
+        landmarks = try c.decode([[Double]].self, forKey: .landmarks)
+        faceTransform = try c.decodeIfPresent([[Double]].self, forKey: .faceTransform)
     }
 }
 
@@ -26,7 +36,7 @@ struct LandmarkFrame: Codable {
 /// with MediaPipe landmark indices 103, 150, 332, 379, 4, 151, 195.
 ///
 /// This produces the input format BlazeGaze was trained on.
-struct HomographyEyePatchExtractor {
+public struct HomographyEyePatchExtractor {
 
     static let patchWidth = 512
     static let patchHeight = 128
@@ -40,7 +50,7 @@ struct HomographyEyePatchExtractor {
     ///   - frameWidth: Frame width in pixels.
     ///   - frameHeight: Frame height in pixels.
     /// - Returns: 512×128 eye patch as a CVPixelBuffer, or nil.
-    static func extract(
+    public static func extract(
         pixelBuffer: CVPixelBuffer,
         landmarks: [[Double]],
         frameWidth: Int,
