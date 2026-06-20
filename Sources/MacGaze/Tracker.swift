@@ -1,30 +1,48 @@
 import Foundation
 import CoreGraphics
 import CoreML
+import CoreVideo
 import Vision
 import GazeBridgeCore
 
 /// MacGaze's implementation of GazeBridge's `TrackerDriver` protocol.
 ///
-/// Uses the built-in FaceTime HD camera + Vision landmarks + BlazeGaze
-/// CoreML model + Gaussian RBF personalisation to produce gaze data
-/// — no external hardware required.
+/// Uses the built-in FaceTime HD camera + BlazeGaze CoreML model +
+/// Gaussian RBF personalisation to produce gaze data — no external
+/// hardware required.
 ///
-/// This is what lets GazeBridge's menu-bar app drive either an eyetuitive
-/// (via GazeFirstTracker) OR the built-in camera (via MacGazeTracker).
+/// Two landmark backends are available:
+/// - `.mediaPipe` (default): Google MediaPipe 478-pt landmarks + homography
+///   eye patch. Exact training format for BlazeGaze. Requires libmediapipe.dylib.
+/// - `.vision`: Apple Vision 76-pt landmarks + approximate eye patch.
+///   Works without MediaPipe but BlazeGaze can't distinguish gaze directions well.
 public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
 
-    public let displayName: String = "Built-in Camera (MacGaze)"
-    public let driverIdentifier: String = "macgaze.builtin"
+    public let displayName: String
+    public let driverIdentifier: String
 
-    // Pipeline components.
+    /// Which landmark detection backend to use.
+    public enum LandmarkBackend: String, CaseIterable, Sendable {
+        case mediaPipe = "MediaPipe (478-pt, default)"
+        case vision = "Apple Vision (76-pt, fallback)"
+    }
+
+    public var backend: LandmarkBackend
+
+    // Pipeline components (shared across backends).
     private let camera: CameraCapture
-    private let detector: FaceLandmarkDetector
-    private let eyePatchExtractor: EyePatchExtractor
-    private let headPose: HeadPoseEstimator
-    private var blazeGaze: BlazeGazeRunner?
+    private let blazeGazeRunner: BlazeGazeRunner?
     private let rbfCorrector: RBFGazeCorrector
     private let calibrationCollector: CalibrationCollector
+
+    // Vision backend components.
+    private let visionDetector = FaceLandmarkDetector()
+    private let visionEyePatch = EyePatchExtractor()
+    private let visionHeadPose = HeadPoseEstimator()
+
+    // MediaPipe backend components.
+    private var mediaPipe: MediaPipeFaceLandmarker?
+    private var mediaPipeTimestampMs: Int64 = 0
 
     // State.
     private let stateLock = NSLock()
@@ -33,26 +51,36 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
 
     // Active streams.
     private var gazeStreamTask: Task<Void, Never>?
-    private var cameraStream: AsyncStream<CameraFrame>?
-    private var cameraContinuation: AsyncStream<CameraFrame>.Continuation?
 
-    // 1-Euro filter for smoothing (reuses GazeBridgeCore).
+    // 1-Euro filter for smoothing.
     private var smootherX = OneEuroFilter()
     private var smootherY = OneEuroFilter()
 
-    public init() {
+    // Calibration callback (set externally by the calibration UI).
+    private var calibrationObservationHandler: ((Double, Double) -> Void)?
+
+    public init(backend: LandmarkBackend = .mediaPipe) {
+        self.displayName = "Built-in Camera (MacGaze)"
+        self.driverIdentifier = "macgaze.builtin"
+        self.backend = backend
         self.camera = CameraCapture()
-        self.detector = FaceLandmarkDetector()
-        self.eyePatchExtractor = EyePatchExtractor()
-        self.headPose = HeadPoseEstimator()
+        self.blazeGazeRunner = try? BlazeGazeRunner()
         self.rbfCorrector = RBFGazeCorrector()
         self.calibrationCollector = CalibrationCollector()
 
-        // Set up camera stream that MacGazeTracker owns.
-        let stream = AsyncStream<CameraFrame> { continuation in
-            self.cameraContinuation = continuation
+        // Try to load MediaPipe if requested.
+        if backend == .mediaPipe {
+            let modelPath = Self.resolveModelPath()
+            if let modelPath {
+                self.mediaPipe = try? MediaPipeFaceLandmarker(modelPath: modelPath)
+                if mediaPipe == nil {
+                    // Fallback to Vision if MediaPipe can't load.
+                    self.backend = .vision
+                }
+            } else {
+                self.backend = .vision
+            }
         }
-        self.cameraStream = stream
     }
 
     // MARK: TrackerDriver — Connection
@@ -71,9 +99,10 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
             stateLock.unlock()
             continuation.yield(current)
             continuation.onTermination = { [weak self] _ in
-                self?.stateLock.lock()
-                self?.stateContinuations.removeValue(forKey: id)
-                self?.stateLock.unlock()
+                guard let self else { return }
+                self.stateLock.lock()
+                self.stateContinuations.removeValue(forKey: id)
+                self.stateLock.unlock()
             }
         }
     }
@@ -82,8 +111,6 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
         setState(.connecting)
         do {
             try await camera.start()
-            // Try to load BlazeGaze model (non-fatal if missing).
-            blazeGaze = try? BlazeGazeRunner()
             setState(.connected)
         } catch {
             setState(.connectionFailed(error.localizedDescription))
@@ -94,7 +121,6 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
     public func disconnect() async {
         gazeStreamTask?.cancel()
         gazeStreamTask = nil
-        cameraContinuation?.finish()
         camera.stop()
         setState(.disconnected)
     }
@@ -113,8 +139,8 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
                 }
                 continuation.finish()
             }
-            continuation.onTermination = { _ in
-                self.gazeStreamTask?.cancel()
+            continuation.onTermination = { [weak self] _ in
+                self?.gazeStreamTask?.cancel()
             }
         }
     }
@@ -122,11 +148,7 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
     // MARK: TrackerDriver — Positioning
 
     public func positioningStream() -> AsyncStream<PositioningInfo> {
-        // MacGaze doesn't have hardware depth sensing; return a synthetic
-        // stream with estimated depth from face bounding box size.
         AsyncStream { continuation in
-            // Phase 5: wire real positioning from HeadPoseEstimator.
-            // For now, emit nothing — GazeBridge handles nil gracefully.
             continuation.finish()
         }
     }
@@ -136,7 +158,7 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
     public func deviceInformation() async throws -> TrackerDeviceInformation {
         TrackerDeviceInformation(
             serial: 0,
-            firmwareVersion: blazeGaze != nil ? "BlazeGaze 1.0" : "unloaded",
+            firmwareVersion: blazeGazeRunner != nil ? "BlazeGaze 1.0 (\(backend == .mediaPipe ? "MediaPipe" : "Vision"))" : "unloaded",
             hardwareConfig: 0,
             machine: "FaceTime HD",
             cpuTempCelsius: 0
@@ -144,15 +166,10 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
     }
 
     public func currentUserSettings() async throws -> TrackerUserSettings {
-        TrackerUserSettings(
-            smoothing: 5,
-            leftEyeOnly: false,
-            rightEyeOnly: false
-        )
+        TrackerUserSettings(smoothing: 5, leftEyeOnly: false, rightEyeOnly: false)
     }
 
     public func applyUserSettings(_ settings: TrackerUserSettings) async throws {
-        // Update 1-Euro filter configuration from smoothing slider.
         let cfg = OneEuroFilter.Configuration.from(smoothingSlider: settings.smoothing)
         smootherX = OneEuroFilter(cfg)
         smootherY = OneEuroFilter(cfg)
@@ -162,16 +179,6 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
 
     public func calibrate(_ options: CalibrationOptions) -> AsyncStream<CalibrationEvent> {
         AsyncStream { continuation in
-            // For Phase 3: we reuse GazeBridge's calibration UI to show
-            // targets, then collect BlazeGaze outputs via this stream.
-            // The actual target loop is driven by GazeBridge's
-            // CalibrationWindowController, which calls
-            // calibrationCollector.startTarget / addObservation /
-            // finishTarget as each point is shown.
-            //
-            // For now, emit .started and let the UI drive the flow.
-            // When all points are collected, GazeBridge calls
-            // confirmCurrentCalibrationPoint() which triggers the RBF solve.
             continuation.yield(.started)
         }
     }
@@ -179,21 +186,16 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
     public func lastCalibrationResult() async throws -> CalibrationResultSummary? {
         guard rbfCorrector.isCalibrated else { return nil }
         return CalibrationResultSummary(
-            overallRating: 0,  // not measured yet
-            points: [],
-            canImprove: false,
+            overallRating: 0, points: [], canImprove: false,
             timestampMs: Int64(Date().timeIntervalSince1970 * 1000)
         )
     }
 
     public func confirmCurrentCalibrationPoint() async throws {
-        // Finish the current target and collect the sample.
         _ = calibrationCollector.finishTarget()
     }
 
-    public func improveCalibrationPoints(_ sequences: [Int]) async throws {
-        // Phase 5: re-collect specific calibration points.
-    }
+    public func improveCalibrationPoints(_ sequences: [Int]) async throws {}
 
     public func stopCalibration() async {
         if calibrationCollector.hasEnoughPoints {
@@ -204,32 +206,99 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
 
     // MARK: Pipeline processing
 
-    /// Process one camera frame through the full pipeline.
     private func processFrame(_ frame: CameraFrame) -> GazeSample {
-        // 1. Vision landmark detection.
-        let detection = detector.detect(frame)
+        switch backend {
+        case .mediaPipe:
+            return processFrameMediaPipe(frame)
+        case .vision:
+            return processFrameVision(frame)
+        }
+    }
 
-        guard detection.stats.faceFound,
-              let vnFace = detector.lastRawObservation,
-              let blazeGaze else {
+    // MARK: MediaPipe pipeline
+
+    private func processFrameMediaPipe(_ frame: CameraFrame) -> GazeSample {
+        guard let mediaPipe, let blazeGazeRunner else {
             return GazeSample.invalid()
         }
 
-        // 2. Extract eye patch.
-        guard let eyePatch = eyePatchExtractor.extract(
-            frame: frame.pixelBuffer,
-            faceObservation: vnFace
+        mediaPipeTimestampMs += 33 // ~30fps
+
+        // 1. MediaPipe landmark detection.
+        guard let mpResult = try? mediaPipe.detect(
+            pixelBuffer: frame.pixelBuffer, timestampMs: mediaPipeTimestampMs
         ) else {
             return GazeSample.invalid()
         }
 
-        // 3. Head pose for BlazeGaze's auxiliary inputs.
-        var headVector: MLMultiArray? = nil
-        var faceOrigin: MLMultiArray? = nil
-        if let pose = headPose.estimate(
-            face: vnFace,
+        guard mpResult.landmarks.count >= 478 else {
+            return GazeSample.invalid()
+        }
+
+        // 2. Homography eye patch (exact training format).
+        guard let eyePatch = HomographyEyePatchExtractor.extract(
+            pixelBuffer: frame.pixelBuffer,
+            landmarks: mpResult.landmarks,
             frameWidth: frame.width,
             frameHeight: frame.height
+        ) else {
+            return GazeSample.invalid()
+        }
+
+        // 3. Head pose from facial transformation matrix.
+        var headVector: MLMultiArray? = nil
+        var faceOrigin: MLMultiArray? = nil
+        if let ft = mpResult.faceTransform, ft.count == 4, ft[0].count >= 3 {
+            let r20 = ft[2][0], r21 = ft[2][1], r22 = ft[2][2]
+            let r10 = ft[1][0], r00 = ft[0][0]
+            let pitch = asin(-r20), yaw = atan2(r21, r22), roll = atan2(r10, r00)
+            let hPitch = -yaw, hYaw = pitch
+            let cp = cos(hPitch), sp = sin(hPitch)
+            let cy = cos(hYaw), sy = sin(hYaw)
+            headVector = try? MLMultiArray(shape: [1, 3], dataType: .float32)
+            faceOrigin = try? MLMultiArray(shape: [1, 3], dataType: .float32)
+            if let hv = headVector {
+                hv[0] = Float(cp * sy) as NSNumber
+                hv[1] = Float(sp) as NSNumber
+                hv[2] = Float(-cp * cy) as NSNumber
+            }
+            if let fo = faceOrigin {
+                fo[0] = Float(ft[0][3]) as NSNumber
+                fo[1] = Float(ft[1][3]) as NSNumber
+                fo[2] = Float(ft[2][3]) as NSNumber
+            }
+        }
+
+        return runBlazeGazeAndSmooth(
+            eyePatch: eyePatch,
+            headVector: headVector,
+            faceOrigin: faceOrigin,
+            blazeGazeRunner: blazeGazeRunner
+        )
+    }
+
+    // MARK: Vision pipeline (fallback)
+
+    private func processFrameVision(_ frame: CameraFrame) -> GazeSample {
+        guard let blazeGazeRunner else { return GazeSample.invalid() }
+
+        let detection = visionDetector.detect(frame)
+
+        guard detection.stats.faceFound,
+              let vnFace = visionDetector.lastRawObservation else {
+            return GazeSample.invalid()
+        }
+
+        guard let eyePatch = visionEyePatch.extract(
+            frame: frame.pixelBuffer, faceObservation: vnFace
+        ) else {
+            return GazeSample.invalid()
+        }
+
+        var headVector: MLMultiArray? = nil
+        var faceOrigin: MLMultiArray? = nil
+        if let pose = visionHeadPose.estimate(
+            face: vnFace, frameWidth: frame.width, frameHeight: frame.height
         ) {
             headVector = try? MLMultiArray(shape: [1, 3], dataType: .float32)
             faceOrigin = try? MLMultiArray(shape: [1, 3], dataType: .float32)
@@ -245,16 +314,33 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
             }
         }
 
-        // 4. BlazeGaze inference.
-        guard let rawGaze = blazeGaze.predict(
+        return runBlazeGazeAndSmooth(
             eyePatch: eyePatch,
             headVector: headVector,
-            faceOrigin3D: faceOrigin
+            faceOrigin: faceOrigin,
+            blazeGazeRunner: blazeGazeRunner
+        )
+    }
+
+    // MARK: Shared BlazeGaze + smoothing + RBF
+
+    private func runBlazeGazeAndSmooth(
+        eyePatch: CVPixelBuffer,
+        headVector: MLMultiArray?,
+        faceOrigin: MLMultiArray?,
+        blazeGazeRunner: BlazeGazeRunner
+    ) -> GazeSample {
+        // BlazeGaze inference.
+        guard let rawGaze = blazeGazeRunner.predict(
+            eyePatch: eyePatch, headVector: headVector, faceOrigin3D: faceOrigin
         ) else {
             return GazeSample.invalid()
         }
 
-        // 5. RBF correction (if calibrated).
+        // Feed calibration collector if active.
+        calibrationObservationHandler?(Double(rawGaze.x), Double(rawGaze.y))
+
+        // RBF correction.
         let corrected: (x: Double, y: Double)
         if rbfCorrector.isCalibrated {
             corrected = rbfCorrector.correct(x: Double(rawGaze.x), y: Double(rawGaze.y))
@@ -262,20 +348,14 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
             corrected = (Double(rawGaze.x), Double(rawGaze.y))
         }
 
-        // 6. 1-Euro smoothing.
+        // 1-Euro smoothing.
         let nowMs = GazeSample.nowMs()
         let smoothedX = smootherX.filter(value: corrected.x, timeMs: nowMs)
         let smoothedY = smootherY.filter(value: corrected.y, timeMs: nowMs)
 
-        // 7. Map to screen coordinates via GazeCoordinateMapper.
+        // Map to screen coordinates.
         let mapper = GazeCoordinateMapper()
         let screenPoint = mapper.map(normalizedX: smoothedX, normalizedY: smoothedY)
-
-        // 8. Feed calibration collector if a target is active.
-        if calibrationCollector.samples.count < 9 {  // still calibrating
-            // CalibrationCollector.addObservation is called externally by
-            // the calibration UI, not here.
-        }
 
         return GazeSample(
             point: screenPoint,
@@ -291,25 +371,21 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
         )
     }
 
-    // MARK: Public API for calibration UI
+    // MARK: Public calibration API
 
     /// Called by the calibration UI when a new target is shown.
     public func beginCalibrationTarget(x: Double, y: Double) {
         calibrationCollector.startTarget(x: x, y: y)
-    }
-
-    /// Called by the calibration UI to feed a raw gaze observation.
-    public func feedCalibrationObservation(x: Double, y: Double) {
-        calibrationCollector.addObservation(
-            x: x, y: y,
-            timestampMs: GazeSample.nowMs()
-        )
+        calibrationObservationHandler = { [weak self] gx, gy in
+            self?.calibrationCollector.addObservation(x: gx, y: gy, timestampMs: GazeSample.nowMs())
+        }
     }
 
     /// Called by the calibration UI when a target's dwell period ends.
     @discardableResult
     public func endCalibrationTarget() -> RBFGazeCorrector.CalibrationSample? {
-        calibrationCollector.finishTarget()
+        calibrationObservationHandler = nil
+        return calibrationCollector.finishTarget()
     }
 
     // MARK: Internals
@@ -320,5 +396,14 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
         let conts = Array(stateContinuations.values)
         stateLock.unlock()
         for c in conts { c.yield(state) }
+    }
+
+    private static func resolveModelPath() -> String? {
+        let candidates = [
+            "Frameworks/face_landmarker_v2_with_blendshapes.task",
+            FileManager.default.currentDirectoryPath + "/Frameworks/face_landmarker_v2_with_blendshapes.task",
+            FileManager.default.currentDirectoryPath + "/macgaze/Frameworks/face_landmarker_v2_with_blendshapes.task",
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0) }
     }
 }
