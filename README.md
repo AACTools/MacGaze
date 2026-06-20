@@ -7,156 +7,170 @@ It runs entirely on-device and conforms to GazeBridge's `TrackerDriver`
 protocol so the same menu-bar app can drive an eyetuitive **or** the
 built-in camera.
 
+**Status:** Pipeline verified — 8.1% mean gaze error with 4-point
+calibration on recorded video. Native MediaPipe + BlazeGaze + RBF, all
+in Swift.
+
 ## Architecture
 
 ```
-AVCaptureSession          Vision Framework (ANE)        BlazeGaze (CoreML)
-   1280×720 30fps    →     Face landmarks Rev 3    →     128×512 eye patch
-   32BGRA                   + pupil positions           + head_vector
-                            + yaw / roll                + face_origin_3d
-                                                             │
-                                                             ▼
-                    RBFGazeCorrector ←── 1-Euro Filter ←── (x, y) screen point
-                    (Gaussian, λ=0.01)                     normalised [0,1]
-                             │
-                             ▼
-                    GazeSample (TrackerDriver protocol)
-                             │
-                             ▼
-                    GazeBridge menu-bar app
-                    (smoothing, snapping, calibration,
-                     track status, onboarding)
+CVPixelBuffer
+  → MediaPipeFaceLandmarker (libmediapipe.dylib, 478-pt landmarks)
+  → HomographyEyePatchExtractor (perspective warp, exact training format)
+  → BlazeGazeRunner (CoreML, 725 KB, 17ms inference)
+  → RBFGazeCorrector (Gaussian RBF, LAPACK dgesv)
+  → corrected (x, y) screen position
 ```
 
 **Model:** BlazeGaze from [WebEyeTrack](https://github.com/RedForestAi/WebEyeTrack)
-(MIT, Vanderbilt 2025). 725 KB CoreML, outputs match Keras to 1e-6.
+(MIT, Vanderbilt 2025). 725 KB CoreML.
 
-## Project structure
+**Face landmarks:** Google MediaPipe Tasks via `libmediapipe.dylib`.
+478 3D landmarks + 4×4 facial transformation matrix.
 
-```
-macgaze/
-├── Sources/MacGaze/
-│   ├── Capture/          CameraCapture (AVCaptureSession)
-│   ├── Vision/           FaceLandmarkDetector (VNDetectFaceLandmarks Rev 3)
-│   ├── Eyes/             EyePatchExtractor (vImage crop + resize)
-│   ├── Gaze/             BlazeGazeRunner, HeadPoseEstimator, RBFGazeCorrector,
-│   │                     CalibrationCollector
-│   └── Tracker.swift     MacGazeTracker: TrackerDriver conformance
-├── Sources/MacGazeSmoke/ CLI perf tool (swift run macgaze-smoke)
-├── Sources/MacGazeEval/  CLI eval tool (swift run macgaze-eval)
-├── Tests/MacGazeTests/   21 unit tests
-├── Apps/MacGazeDebug/    SwiftUI debug app (camera + landmarks + gaze overlay)
-├── Tools/Conversion/     BlazeGaze Keras→CoreML conversion script
-└── docs/                 (gitignored — internal planning docs)
-```
-
-## Building
+## Quick start
 
 ```sh
-swift build          # library + CLI tools
-swift test           # 21 unit tests (~0.03s)
-xcodegen generate    # generate MacGazeDebug.xcodeproj
+git clone https://github.com/AACTools/MacGaze.git
+cd MacGaze
+chmod +x scripts/setup.sh
+./scripts/setup.sh
 ```
+
+This handles: BlazeGaze model conversion, MediaPipe native library,
+Python venv setup, Xcode project generation. See [TESTING.md](TESTING.md)
+for the full test checklist.
 
 Requires macOS 15+, Xcode 16+, Apple Silicon.
 
 ## Running
 
-**Smoke test** (no GUI, no Metal):
+**Unit tests (no camera):**
+```sh
+swift test
+```
+
+**Camera + Vision perf test:**
 ```sh
 swift run macgaze-smoke --seconds 10
 ```
 
-**Debug app** (camera + BlazeGaze live):
+**Headless pipeline test on recorded video:**
 ```sh
-open ~/GitHub/gaze/Gaze.xcworkspace
-# Select MacGazeDebug scheme → ⌘B → then open the built .app directly
+swift run macgaze-replay ~/path/to/video.mov --native --verbose
 ```
 
-**Convert BlazeGaze model** (if `.mlmodelc` is missing):
+**With RBF calibration:**
 ```sh
-cd Tools/Conversion
-git clone --depth=1 https://github.com/RedForestAI/WebEyeTrack.git WebEyeTrack-upstream
-. .venv/bin/activate   # needs tensorflow + coremltools
-python convert_blazegaze.py
+swift run macgaze-replay ~/path/to/video.mov --native \
+  --calibrate "0:2:0.5:0.5 2:4:0.8:0.5 4:6:0.2:0.5 6:8:0.5:0.8"
 ```
 
-## Known snag: M1 Metal crash
-
-**MacGazeDebug.app crashes on base M1 hardware** (tested on an original
-M1 MacBook running hot). The crash is in macOS's Metal framework:
-
+**Debug app (camera + BlazeGaze live):**
+```sh
+xcodegen generate
+# Then either open via Xcode or launch directly:
+APP=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 6 \
+  -name MacGazeDebug.app -type d -not -path "*Index.noindex*" | head -1)
+open "$APP"
 ```
-GPUToolsCapture → CaptureMTLCommandBuffer commitAndWaitUntilSubmitted
-→ Metal setLabel: → -[__NSCFNumber length]: unrecognized selector
-```
-
-This is a **system-level Metal telemetry bug**, not a code bug. The CLI
-tools (`macgaze-smoke`, `macgaze-eval`) work fine — only the SwiftUI
-debug display triggers it. **Likely works on M2/M3; needs testing.**
-
-Workarounds tried (all insufficient on this M1):
-- CPU-only CIContext — still crashed at init
-- vImage + CGContext (no Metal) — still crashed in Core Animation
-- Display throttle (10 fps) — delayed but didn't prevent crash
-- Metal warmup at launch — didn't help
-- `METAL_DEVICE_WRAPPER_TYPE=0` — didn't help
-
-The underlying library is correct and fully unit-tested. The crash only
-affects the live display rendering path.
-
-## What's done
-
-- ✅ Camera + Vision pipeline (7.6 ms p50, 30 fps, 100% face detection)
-- ✅ BlazeGaze CoreML conversion (725 KB, verified to 1e-6)
-- ✅ Eye patch extraction — BOTH Vision-based (approximate) AND homography
-  with MediaPipe landmarks (exact training format)
-- ✅ Head pose estimation (Vision yaw/roll + landmark pitch; MediaPipe 4×4 matrix)
-- ✅ Gaussian RBF calibration (Accelerate/LAPACK, λ=0.01 ridge) — **9.3% mean error verified**
-- ✅ CalibrationCollector with 2σ outlier rejection
-- ✅ `MacGazeTracker: TrackerDriver` (plugs into GazeBridge)
-- ✅ Evaluation Recorder (in GazeBridge) + offline eval CLI
-- ✅ **Full pipeline verified on recorded video: MediaPipe landmarks → BlazeGaze → RBF → corrected gaze**
-- ✅ 21 unit tests
 
 ## Verified results (2026-06-20)
 
-On a recorded video looking at center/right/left/down with 4-point RBF calibration:
+On a recorded video looking at center/right/left/down with 4-point RBF
+calibration, native MediaPipe + BlazeGaze pipeline:
 
 | Direction | Corrected (x,y) | Target (x,y) | Error |
 |---|---|---|---|
-| Center | (0.56, 0.51) | (0.5, 0.5) | 0.06 |
-| Right | (0.94, 0.46) | (0.8, 0.5) | 0.14 |
-| Left | (0.05, 0.63) | (0.2, 0.5) | 0.15 |
-| Down | (0.48, 0.78) | (0.5, 0.8) | 0.03 |
-| **Mean** | | | **0.093** |
+| Center | (0.52, 0.51) | (0.5, 0.5) | 0.024 |
+| Right | (0.98, 0.47) | (0.8, 0.5) | 0.18 |
+| Left | (0.00, 0.62) | (0.2, 0.5) | 0.20 |
+| Down | (0.42, 0.78) | (0.5, 0.8) | 0.08 |
+| **Mean** | | | **0.081** |
 
-## What's remaining
+## Project structure
 
-1. **Native MediaPipe in Swift** — replace the Python landmark extractor with
-   native Swift MediaPipe (C++ framework via Bazel, or wait for SPM support).
-   Currently using a Python→JSON→Swift hybrid that works but isn't real-time.
-2. **Driver picker in GazeBridge** — already wired but needs live testing
-3. **9-point calibration** (instead of 4) — more RBF points = better accuracy
-4. **Real-time pipeline** — once native MediaPipe is in, the full pipeline
-   runs at 30fps (25ms p50 proven by macgaze-smoke)
-5. **Fix MacGazeDebug.app crash on M1** — Metal telemetry bug in
-   GPUToolsCapture/RenderBox. Works on M2+ (likely).
-6. **Accuracy tuning** — head pose math, eye patch crop, RBF σ adjustment
+```
+MacGaze/
+├── Sources/
+│   ├── CMediaPipe/               C bridge for libmediapipe.dylib
+│   ├── MacGaze/
+│   │   ├── Capture/              CameraCapture (AVCaptureSession)
+│   │   ├── Vision/               FaceLandmarkDetector (Apple Vision)
+│   │   │                         MediaPipeFaceLandmarker (native)
+│   │   ├── Eyes/                 EyePatchExtractor (Vision-based)
+│   │   │                         HomographyEyePatchExtractor (MediaPipe)
+│   │   ├── Gaze/                 BlazeGazeRunner, HeadPoseEstimator,
+│   │   │                         RBFGazeCorrector, CalibrationCollector
+│   │   └── Tracker.swift         MacGazeTracker: TrackerDriver
+│   ├── MacGazeSmoke/             CLI perf tool
+│   ├── MacGazeReplay/            CLI pipeline test + calibration
+│   └── MacGazeEval/              CLI evaluation tool
+├── Tests/MacGazeTests/           21 unit tests
+├── Apps/MacGazeDebug/            SwiftUI debug app
+├── Tools/Conversion/             BlazeGaze Keras→CoreML + MediaPipe tools
+├── Frameworks/                   libmediapipe.dylib + .task model (gitignored)
+├── scripts/setup.sh              One-time setup script
+└── TESTING.md                    Full test checklist
+```
+
+## Setup details
+
+The `./scripts/setup.sh` script handles:
+
+1. Builds the Swift package (verifies GazeBridgeCore dependency)
+2. Converts BlazeGaze Keras → CoreML (needs Python + tensorflow + coremltools)
+3. Copies `libmediapipe.dylib` from the Python `mediapipe` package
+4. Downloads the MediaPipe `face_landmarker.task` model
+5. Runs unit tests
+6. Generates the Xcode project
+
+**Manual setup** (if the script fails):
+
+```sh
+# 1. Clone WebEyeTrack for the BlazeGaze model
+cd Tools/Conversion
+git clone --depth=1 https://github.com/RedForestAI/WebEyeTrack.git WebEyeTrack-upstream
+
+# 2. Set up Python venv
+python3 -m venv .venv
+.venv/bin/pip install tensorflow coremltools mediapipe
+
+# 3. Convert BlazeGaze model
+.venv/bin/python convert_blazegaze.py
+cd ../..
+xcrun coremlc compile Sources/MacGaze/Gaze/blazegaze.mlpackage Sources/MacGaze/Gaze
+
+# 4. Copy MediaPipe native library
+mkdir -p Frameworks
+cp Tools/Conversion/.venv/lib/python*/site-packages/mediapipe/tasks/c/libmediapipe.dylib Frameworks/
+cp Tools/Conversion/WebEyeTrack-upstream/python/webeyetrack/model_weights/face_landmarker_v2_with_blendshapes.task Frameworks/
+
+# 5. Generate Xcode project
+xcodegen generate
+```
+
+## Known issues
+
+1. **MacGazeDebug.app crashes on some M1 Macs** — Metal telemetry bug in
+   GPUToolsCapture/RenderBox. CLI tools (`macgaze-smoke`, `macgaze-replay`)
+   are unaffected. Likely works on M2+.
+2. **MediaPipe latency ~170ms/frame** — BGRA→RGB pixel conversion is the
+   bottleneck. Optimizable with vImage.
+3. **4-point calibration only** — accuracy will improve with 9-point.
 
 ## Relationship to GazeBridge
 
-Both projects live at `~/GitHub/gaze/`:
-
+Both projects live as siblings:
 ```
 gaze/
-├── gazebridge/    ← host menu-bar app (AACTools/GazeBridge on GitHub)
+├── gazebridge/    ← host menu-bar app (AACTools/GazeBridge)
 ├── macgaze/       ← this project (AACTools/MacGaze)
 └── Gaze.xcworkspace   ← open this in Xcode (contains both projects)
 ```
 
-Open `Gaze.xcworkspace` (not individual `.xcodeproj` files) to avoid
-package-lock conflicts from the shared `GazeBridgeCore` dependency.
+MacGaze depends on `GazeBridgeCore` (the shared library). Clone both
+repos under the same parent directory.
 
 ## License
 

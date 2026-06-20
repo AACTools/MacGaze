@@ -1,0 +1,154 @@
+# MacGaze — Testing Checklist
+
+> For anyone cloning the repo and verifying it works. Test on macOS 15+
+> Apple Silicon. Last updated 2026-06-20.
+
+## Prerequisites
+
+- macOS 15.0+ (Sequoia / Sonoma)
+- Xcode 16+
+- Apple Silicon (M1/M2/M3/M4)
+- Webcam (built-in FaceTime HD or external)
+
+## Setup
+
+```sh
+git clone https://github.com/AACTools/MacGaze.git
+cd MacGaze
+chmod +x scripts/setup.sh
+./scripts/setup.sh
+```
+
+This installs everything: BlazeGaze model conversion, MediaPipe native
+library, Python venv (for conversion only), Xcode project generation.
+
+## Test Checklist
+
+### 1. Unit tests (no camera needed)
+
+```sh
+swift test
+```
+
+**Expected:** 21 tests pass, 0 failures, < 1 second.
+
+Tests cover: OneEuroFilter, GazeSmoother, GazeCoordinateMapper,
+PositioningInfo depth zones, UISnapSettings, UISnapper math,
+CalibrationPointCount, TrackerUserSettings, CalibrationOptions,
+GazeSample, RBFGazeCorrector (9 tests), CalibrationCollector (6 tests).
+
+### 2. Camera + Vision smoke test (needs camera)
+
+```sh
+swift run macgaze-smoke --seconds 10
+```
+
+**Expected:** 30 fps, ~10-25ms median latency, > 95% face detection rate.
+
+First run triggers a camera permission prompt — grant it in System
+Settings → Privacy & Security → Camera for your terminal/IDE.
+
+### 3. Headless pipeline test (needs camera OR recorded video)
+
+**Option A — live camera:**
+```sh
+swift run macgaze-replay --help  # see usage
+# Live camera test not yet supported via macgaze-replay (use MacGazeDebug.app instead).
+```
+
+**Option B — recorded video:**
+```sh
+# Record a 10s video looking at: center (2s) → right (2s) → left (2s) → down (2s) → center (2s)
+# Use QuickTime → File → New Movie Recording → save as test.mov
+
+# Run with native MediaPipe:
+swift run macgaze-replay ~/path/to/test.mov --native --verbose
+
+# Expected: 100% face detection, 100% gaze prediction, gaze values vary with eye position.
+```
+
+**Option C — with RBF calibration:**
+```sh
+# Use the same timing as your recording:
+swift run macgaze-replay ~/path/to/test.mov --native \
+  --calibrate "0:2:0.5:0.5 2:4:0.8:0.5 4:6:0.2:0.5 6:8:0.5:0.8"
+
+# Expected: mean calibration error < 0.15 (15%).
+# If < 0.10 (10%): GOOD. If 0.10-0.20: OKAY. If > 0.20: POOR.
+```
+
+### 4. Debug app (needs camera + Metal-capable display)
+
+```sh
+xcodegen generate
+# Option A: launch directly (avoids Metal debugger issues on some machines):
+APP=$(find ~/Library/Developer/Xcode/DerivedData -maxdepth 6 \
+  -name MacGazeDebug.app -type d -not -path "*Index.noindex*" | head -1)
+open "$APP"
+
+# Option B: via Xcode workspace:
+open ~/GitHub/gaze/Gaze.xcworkspace
+# Select MacGazeDebug scheme → ⌘B → then open the .app directly
+```
+
+**Expected:** window opens showing camera feed with green bounding box +
+red/blue pupil dots. Sidebar shows FPS, detection latency, BlazeGaze
+gaze predictions (x, y).
+
+**Known issue:** On some M1 Macs, the app crashes with
+`-[__NSCFNumber length]: unrecognized selector` in Metal's
+GPUToolsCapture/RenderBox. This is a system-level Metal bug, not a code
+bug. The CLI tools (macgaze-smoke, macgaze-replay) are unaffected.
+Likely works on M2+.
+
+### 5. GazeBridge integration test (needs eyetuitive OR MacGaze)
+
+```sh
+# Open the workspace (contains both GazeBridge and MacGaze projects):
+open ~/GitHub/gaze/Gaze.xcworkspace
+
+# Select GazeBridge scheme → build → launch.
+# Click the eye icon in the menu bar → Tracker → Built-in Camera (MacGaze).
+# The GazeBridge menu bar app should now use MacGaze as its gaze source.
+```
+
+**Note:** GazeBridge's repo needs to be cloned alongside MacGaze:
+```sh
+git clone https://github.com/AACTools/GazeBridge.git
+# Both repos should be siblings under the same parent directory.
+```
+
+## Known Issues
+
+1. **MacGazeDebug.app Metal crash on M1** — system-level Metal telemetry
+   bug. CLI tools unaffected. M2+ should work.
+2. **MediaPipe latency (~170ms)** — the BGRA→RGB pixel conversion loop
+   dominates. Optimizable with vImage to <30ms.
+3. **Strabismus** — alternating strabismus adds noise. RBF calibration
+   compensates for the individual offset.
+4. **Accuracy with 4 calibration points** — 8-9% error. With 9 points,
+   expect < 5%.
+
+## What to Report
+
+If testing on M2+, please report:
+- Does MacGazeDebug.app open without crashing?
+- What's the BlazeGaze inference latency in the sidebar?
+- Does the gaze (x, y) in the sidebar track your eye movements?
+- Run `swift run macgaze-smoke --seconds 10` and share the output.
+
+## File Locations After Setup
+
+```
+MacGaze/
+├── Sources/MacGaze/Gaze/blazegaze.mlmodelc/    ← BlazeGaze CoreML model
+├── Sources/MacGaze/Gaze/blazegaze.mlpackage/   ← source (can delete)
+├── Frameworks/
+│   ├── libmediapipe.dylib                      ← 48MB MediaPipe native lib
+│   └── face_landmarker_v2_with_blendshapes.task ← 3.6MB MediaPipe model
+├── Tools/Conversion/
+│   ├── .venv/                                  ← Python venv (setup only)
+│   └── WebEyeTrack-upstream/                   ← MIT model source
+├── MacGazeDebug.xcodeproj                      ← generated by xcodegen
+└── Gaze.xcworkspace                            ← workspace (at parent level)
+```
