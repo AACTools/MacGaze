@@ -175,10 +175,12 @@ final class DebugPipeline: ObservableObject {
 
     // MARK: Rendering
 
-    /// Shared CIContext for rendering camera frames.  Creating a CIContext
-    /// per-frame crashes Metal (label race in setLabel:).  One shared
-    /// instance is the standard pattern and also much faster.
-    private static let sharedCIContext = CIContext()
+    /// CPU-only CIContext for rendering camera frames.  Avoids Metal to
+    /// prevent a race with the macOS Portrait/VFX effects system.
+    private static let sharedCIContext = CIContext(options: [
+        .useSoftwareRenderer: true,
+        .priorityRequestLow: true,
+    ])
 
     /// Convert a 32BGRA CVPixelBuffer to an NSImage for display.
     /// Mirrored horizontally to match the user's expectation (like

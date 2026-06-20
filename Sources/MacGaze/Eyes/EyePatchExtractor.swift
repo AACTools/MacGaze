@@ -31,10 +31,15 @@ public final class EyePatchExtractor {
     public static let patchWidth = 512
     public static let patchHeight = 128
 
-    /// Shared CIContext — creating one per call is expensive + can crash
-    /// Metal's command queue labeller under load.  One instance for the
-    /// lifetime of the extractor.
-    private let ciContext = CIContext()
+    /// CPU-only CIContext — avoids Metal entirely to prevent a race
+    /// condition with the macOS Portrait/VFX camera effects system
+    /// which initializes its own Metal context concurrently when the
+    /// camera starts.  CPU rendering is fast enough for 512×128 crop +
+    /// resize at 30 fps.
+    private let ciContext = CIContext(options: [
+        .useSoftwareRenderer: true,
+        .priorityRequestLow: true,
+    ])
 
     public init() {}
 
