@@ -19,8 +19,20 @@ RELEASE_URL="https://github.com/AACTools/MacGaze/releases/download/v0.1.0-assets
 echo "=== MacGaze Setup ==="
 echo ""
 
+# 0. Check for GazeBridge sibling repo (MacGaze depends on it).
+echo "[0/6] Checking GazeBridge dependency..."
+PARENT="$(cd "$ROOT/.." && pwd)"
+if [ ! -d "$PARENT/gazebridge" ]; then
+    echo "  GazeBridge not found. Cloning as sibling repo..."
+    git clone https://github.com/AACTools/GazeBridge.git "$PARENT/gazebridge"
+    echo "  GazeBridge: cloned"
+else
+    echo "  GazeBridge: already present"
+fi
+
 # 1. Check prerequisites.
-echo "[1/5] Checking prerequisites..."
+echo ""
+echo "[1/6] Checking prerequisites..."
 command -v swift >/dev/null || { echo "ERROR: Swift not found. Install Xcode 16+."; exit 1; }
 command -v xcodegen >/dev/null || {
     echo "  xcodegen not found. Installing via Homebrew..."
@@ -38,7 +50,7 @@ fi
 
 # 2. Download pre-built assets from GitHub releases.
 echo ""
-echo "[2/5] Downloading pre-built assets..."
+echo "[2/6] Downloading pre-built assets..."
 
 mkdir -p Frameworks
 mkdir -p Sources/MacGaze/Gaze
@@ -74,19 +86,19 @@ fi
 
 # 3. Build the Swift package.
 echo ""
-echo "[3/5] Building Swift package..."
+echo "[3/6] Building Swift package..."
 swift build 2>&1 | tail -1
 echo "  Build: OK"
 
 # 4. Run tests.
 echo ""
-echo "[4/5] Running unit tests..."
+echo "[4/6] Running unit tests..."
 swift test 2>&1 | grep "Executed.*tests" | tail -1
 echo "  Tests: OK"
 
 # 5. Generate Xcode project.
 echo ""
-echo "[5/5] Generating Xcode project..."
+echo "[5/6] Generating Xcode project..."
 xcodegen generate 2>&1 | tail -1
 echo "  Xcode project: OK"
 
@@ -104,6 +116,9 @@ echo ""
 echo "  # With RBF calibration:"
 echo "  swift run macgaze-replay ~/path/to/video.mov --native \\"
 echo "    --calibrate \"0:2:0.5:0.5 2:4:0.8:0.5 4:6:0.2:0.5 6:8:0.5:0.8\""
+echo ""
+echo "  # Open the workspace (contains both MacGaze + GazeBridge):"
+echo "  open ~/GitHub/gaze/Gaze.xcworkspace  # adjust path to match your layout"
 echo ""
 echo "  # Debug app (camera + BlazeGaze live):"
 echo "  xcodegen generate"
