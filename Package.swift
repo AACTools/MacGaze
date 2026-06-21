@@ -11,6 +11,7 @@ let package = Package(
         .executable(name: "macgaze-smoke", targets: ["MacGazeSmoke"]),
         .executable(name: "macgaze-eval", targets: ["MacGazeEval"]),
         .executable(name: "macgaze-replay", targets: ["MacGazeReplay"]),
+        .executable(name: "macgaze-calibrate", targets: ["MacGazeCalibrate"]),
     ],
     dependencies: [
         // Reuse GazeBridgeCore (OneEuroFilter, TrackerDriver protocol, etc.)
@@ -47,6 +48,11 @@ let package = Package(
             name: "MacGazeReplay",
             dependencies: ["MacGaze"],
             path: "Sources/MacGazeReplay"
+        ),
+        .executableTarget(
+            name: "MacGazeCalibrate",
+            dependencies: ["MacGaze"],
+            path: "Sources/MacGazeCalibrate"
         ),
         .testTarget(
             name: "MacGazeTests",
