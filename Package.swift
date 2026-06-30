@@ -29,7 +29,11 @@ let package = Package(
                 "CMediaPipe",
                 .product(name: "GazeBridgeCore", package: "gazebridge"),
             ],
-            path: "Sources/MacGaze"
+            path: "Sources/MacGaze",
+            exclude: [
+                "Gaze/blazegaze.mlmodelc",
+                "Gaze/blazegaze.mlpackage",
+            ]
         ),
         .executableTarget(
             name: "MacGazeSmoke",

@@ -67,29 +67,16 @@ public final class BlazeGazeRunner {
         }
     }
 
-    /// Convenience: try to locate the model in the main bundle, then
-    /// fall back to common development paths.
+    /// Convenience: try to locate the model. The model is NOT embedded in
+    /// the Swift package (that causes Metal shader auto-registration → crash
+    /// on some M1 machines). It's loaded at runtime from development paths.
     public convenience init() throws {
-        // 1. Try the main bundle.
-        if let url = Bundle.main.url(forResource: "blazegaze", withExtension: "mlmodelc") {
-            try self.init(modelURL: url)
-            return
-        }
-        // 2. Try the MacGaze package itself (for library consumers).
-        if let url = Bundle(for: BlazeGazeRunner.self)
-            .url(forResource: "blazegaze", withExtension: "mlmodelc") {
-            try self.init(modelURL: url)
-            return
-        }
-        // 3. Development fallback: look for the model relative to the
-        //    workspace root.
+        // Development paths — model lives in Sources/MacGaze/Gaze/ but is
+        // excluded from the package via `exclude` in Package.swift.
         let devPaths = [
-            // SwiftPM build output
-            FileManager.default.currentDirectoryPath +
-                "/Sources/MacGaze/Gaze/blazegaze.mlmodelc",
-            // DerivedData
-            FileManager.default.currentDirectoryPath +
-                "/macgaze/Sources/MacGaze/Gaze/blazegaze.mlmodelc",
+            "Sources/MacGaze/Gaze/blazegaze.mlmodelc",
+            FileManager.default.currentDirectoryPath + "/Sources/MacGaze/Gaze/blazegaze.mlmodelc",
+            FileManager.default.currentDirectoryPath + "/macgaze/Sources/MacGaze/Gaze/blazegaze.mlmodelc",
         ]
         for path in devPaths {
             if FileManager.default.fileExists(atPath: path) {
@@ -97,8 +84,13 @@ public final class BlazeGazeRunner {
                 return
             }
         }
+        // Main bundle (if shipped as a resource by the host app).
+        if let url = Bundle.main.url(forResource: "blazegaze", withExtension: "mlmodelc") {
+            try self.init(modelURL: url)
+            return
+        }
         throw Error.modelNotFound(
-            "blazegaze.mlmodelc — run Tools/Conversion/convert_blazegaze.py first"
+            "blazegaze.mlmodelc — run scripts/setup.sh first"
         )
     }
 
