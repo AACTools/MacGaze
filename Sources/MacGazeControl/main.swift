@@ -253,9 +253,13 @@ struct MacGazeControl {
                 faceOrigin = makeVec(pose.faceOrigin3D)
             }
         } else if let landmarker {
+            // MediaPipe VIDEO mode needs strictly-increasing timestamps; the
+            // camera's can duplicate a millisecond and wedge the graph. Use a
+            // monotonic counter instead.
+            mpTimestamp += 33
             guard let mpResult = try? landmarker.detect(
                 pixelBuffer: frame.pixelBuffer,
-                timestampMs: Int64(frame.timestampSeconds * 1000)
+                timestampMs: mpTimestamp
             ), mpResult.landmarks.count >= 468 else { return nil }
             landmarks = mpResult.landmarks
 
@@ -311,6 +315,7 @@ struct MacGazeControl {
 
     nonisolated(unsafe) static var hpErrorSum = 0.0
     nonisolated(unsafe) static var hpErrorN = 0
+    nonisolated(unsafe) static var mpTimestamp: Int64 = 0
 
     static func makeVec(_ v: [Float]) -> MLMultiArray? {
         guard v.count == 3, let a = try? MLMultiArray(shape: [1, 3], dataType: .float32) else { return nil }

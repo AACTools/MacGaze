@@ -39,7 +39,7 @@ public enum HeadPoseSolver {
         // Observed landmarks → isotropic camera-ish 3D (Y up, matching canonical).
         func observed(_ i: Int) -> (Double, Double, Double) {
             let p = landmarks[i]
-            return ((p[0] - 0.5) * w, (0.5 - p[1]) * h, -p[2] * w)
+            return ((p[0] - 0.5) * w, (0.5 - p[1]) * h, p[2] * w)
         }
         // Canonical model with WebEyeTrack's [-1, 1, -1] flip.
         func canonical(_ i: Int) -> (Double, Double, Double) {
