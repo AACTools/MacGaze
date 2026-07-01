@@ -125,7 +125,8 @@ public final class RBFGazeCorrector {
         var ipiv = [__CLPK_integer](repeating: 0, count: n)
         var info: __CLPK_integer = 0
 
-        withUnsafeMutablePointer(to: &nParam) { nPtr in
+        // dgesv_ writes results through the pointers; there is no return value to use.
+        _ = withUnsafeMutablePointer(to: &nParam) { nPtr in
             withUnsafeMutablePointer(to: &nrhs) { nrhsPtr in
                 withUnsafeMutablePointer(to: &lda) { ldaPtr in
                     withUnsafeMutablePointer(to: &ldb) { ldbPtr in
