@@ -99,6 +99,8 @@ struct MacGazeControl {
                 ("center", 0.5, 0.5),
                 ("right",  0.8, 0.5),
                 ("left",   0.2, 0.5),
+                ("up",     0.5, 0.2),
+                ("down",   0.5, 0.8),
             ]
             var samples: [RBFGazeCorrector.CalibrationSample] = []
             var timestampMs: Int64 = 0
@@ -169,15 +171,12 @@ struct MacGazeControl {
         say("Cursor control active")
 
         // Smoothing.
-        var smootherX = OneEuroFilter()
-        var smootherY = OneEuroFilter()
+        let smootherX = OneEuroFilter()
+        let smootherY = OneEuroFilter()
         smootherX.configure(minCutoff: 1.0, beta: 0.02)
         smootherY.configure(minCutoff: 1.0, beta: 0.02)
 
-        var frameCount = 0
         let startTime = Date()
-        var lastFpsTime = startTime
-        var fpsFrames = 0
         var prevTimestamp: CFAbsoluteTime = 0
 
         // Main loop: camera → gaze → cursor.
@@ -187,8 +186,6 @@ struct MacGazeControl {
             prevTimestamp = nowTs
 
             let nowMs = Int64(Date().timeIntervalSince(startTime) * 1000)
-            frameCount += 1
-            fpsFrames += 1
 
             let pipeStart = CFAbsoluteTimeGetCurrent()
             guard let gaze = runPipeline(frame: frame, landmarker: landmarker, coreMLMesh: coreMLMesh, blazeGaze: blazeGaze) else {
