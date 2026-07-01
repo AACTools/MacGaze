@@ -461,6 +461,10 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
     }
 
     private static func resolveFaceMeshModelURL() -> URL? {
+        // Bundled resource (GUI app) first, then dev/cwd-relative paths (CLI).
+        if let url = Bundle.main.url(forResource: "face_mesh", withExtension: "mlmodelc") {
+            return url
+        }
         let cwd = FileManager.default.currentDirectoryPath
         let candidates = [
             "Models/face_mesh.mlmodelc",
