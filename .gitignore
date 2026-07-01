@@ -36,6 +36,13 @@ Data/Evaluation/*/
 # Converted model artifacts (large)
 Sources/MacGaze/Gaze/*.mlmodelc
 *.mlpackage
+# CoreML FaceMesh (PINTO #032) — fetch+compile locally, don't commit
+Models/
+
+# Local probe / test artifacts (incl. personal face photos)
+demoPic.jpg
+demoPic.jpeg
+facemesh_probe_out.png
 
 # MediaPipe native library (48MB, not redistributable via git)
 Frameworks/libmediapipe.dylib

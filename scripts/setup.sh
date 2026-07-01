@@ -84,6 +84,22 @@ else
     echo "  face_landmarker.task: $(du -sh Frameworks/face_landmarker_v2_with_blendshapes.task | cut -f1)"
 fi
 
+# CoreML FaceMesh (PINTO #032) — the ANE landmark path (docs/coreml-facemesh-plan.md).
+# Not on our release; fetched from PINTO_model_zoo's public S3 and compiled locally.
+if [ -d "Models/face_mesh.mlmodelc" ]; then
+    echo "  FaceMesh CoreML: already present"
+else
+    echo "  Downloading + compiling CoreML FaceMesh (PINTO #032)..."
+    mkdir -p Models
+    curl -sL "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/032_FaceMesh/032_FaceMesh.tar.gz" -o /tmp/mg_facemesh.tar.gz
+    tar -xzf /tmp/mg_facemesh.tar.gz -C /tmp
+    tar -xzf /tmp/032_FaceMesh/07_coreml/resources.tar.gz -C /tmp
+    xcrun coremlcompiler compile /tmp/face_mesh.mlmodel Models/ >/dev/null
+    cp /tmp/face_mesh.mlmodel Models/face_mesh.mlmodel
+    rm -rf /tmp/mg_facemesh.tar.gz /tmp/032_FaceMesh /tmp/face_mesh.mlmodel
+    echo "  FaceMesh CoreML: $(du -sh Models/face_mesh.mlmodelc | cut -f1)"
+fi
+
 # 3. Build the Swift package.
 echo ""
 echo "[3/6] Building Swift package..."
