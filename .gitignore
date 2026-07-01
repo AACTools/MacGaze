@@ -18,7 +18,7 @@ xcuserdata/
 
 # Internal thinking docs — kept locally, not committed.
 # Forward-facing docs live in README.md at the root.
-docs/
+
 
 # WebEyeTrack upstream clone — local inspection only.
 # Re-clone with: git clone --depth=1 https://github.com/RedForestAI/WebEyeTrack.git
