@@ -243,10 +243,15 @@ struct MacGazeControl {
         var faceOrigin: MLMultiArray? = nil
 
         if let mesh = coreMLMesh {
-            // CoreML FaceMesh (ANE). No head pose yet (Phase 2.2 = PnP).
+            // CoreML FaceMesh (ANE) + reconstructed head pose (Kabsch).
             guard let r = mesh.detect(pixelBuffer: frame.pixelBuffer),
                   r.landmarks.count >= 468 else { return nil }
             landmarks = r.landmarks
+            if let pose = HeadPoseSolver.solve(landmarks: r.landmarks,
+                                               width: frame.width, height: frame.height) {
+                headVector = makeVec(pose.headVector)
+                faceOrigin = makeVec(pose.faceOrigin3D)
+            }
         } else if let landmarker {
             guard let mpResult = try? landmarker.detect(
                 pixelBuffer: frame.pixelBuffer,
@@ -274,6 +279,21 @@ struct MacGazeControl {
                     fo[1] = Float(ft[1][3]) as NSNumber
                     fo[2] = Float(ft[2][3]) as NSNumber
                 }
+
+                // Validation: Kabsch head pose vs MediaPipe ground truth.
+                if let pose = HeadPoseSolver.solve(landmarks: landmarks,
+                                                   width: frame.width, height: frame.height) {
+                    let R = [[ft[0][0], ft[0][1], ft[0][2]],
+                             [ft[1][0], ft[1][1], ft[1][2]],
+                             [ft[2][0], ft[2][1], ft[2][2]]]
+                    let gt = HeadPoseSolver.headVector(from: R)
+                    let e = angleDeg(gt, pose.headVector)
+                    hpErrorSum += e; hpErrorN += 1
+                    if hpErrorN % 15 == 0 {
+                        print(String(format: "    [headpose] Kabsch vs MediaPipe: %.1f° (avg %.1f°)",
+                                     e, hpErrorSum / Double(hpErrorN)))
+                    }
+                }
             }
         } else {
             return nil
@@ -287,6 +307,23 @@ struct MacGazeControl {
         ) else { return nil }
 
         return blazeGaze.predict(eyePatch: eyePatch, headVector: headVector, faceOrigin3D: faceOrigin)
+    }
+
+    nonisolated(unsafe) static var hpErrorSum = 0.0
+    nonisolated(unsafe) static var hpErrorN = 0
+
+    static func makeVec(_ v: [Float]) -> MLMultiArray? {
+        guard v.count == 3, let a = try? MLMultiArray(shape: [1, 3], dataType: .float32) else { return nil }
+        a[0] = v[0] as NSNumber; a[1] = v[1] as NSNumber; a[2] = v[2] as NSNumber
+        return a
+    }
+
+    static func angleDeg(_ a: [Float], _ b: [Float]) -> Double {
+        let dot = Double(a[0]*b[0] + a[1]*b[1] + a[2]*b[2])
+        let na = Double(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]).squareRoot()
+        let nb = Double(b[0]*b[0] + b[1]*b[1] + b[2]*b[2]).squareRoot()
+        guard na > 0, nb > 0 else { return .nan }
+        return acos(max(-1, min(1, dot / (na * nb)))) * 180 / .pi
     }
 
     static func resolveFaceMeshURL() -> URL? {

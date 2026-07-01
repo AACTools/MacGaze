@@ -14,6 +14,7 @@ let package = Package(
         .executable(name: "macgaze-calibrate", targets: ["MacGazeCalibrate"]),
         .executable(name: "macgaze-control", targets: ["MacGazeControl"]),
         .executable(name: "macgaze-facemesh-probe", targets: ["MacGazeFaceMeshProbe"]),
+        .executable(name: "macgaze-headpose-check", targets: ["MacGazeHeadPoseCheck"]),
     ],
     dependencies: [
         // Reuse GazeBridgeCore (OneEuroFilter, TrackerDriver protocol, etc.)
@@ -69,6 +70,11 @@ let package = Package(
             name: "MacGazeFaceMeshProbe",
             dependencies: ["MacGaze"],
             path: "Sources/MacGazeFaceMeshProbe"
+        ),
+        .executableTarget(
+            name: "MacGazeHeadPoseCheck",
+            dependencies: ["MacGaze"],
+            path: "Sources/MacGazeHeadPoseCheck"
         ),
         .testTarget(
             name: "MacGazeTests",
