@@ -56,7 +56,9 @@ public struct HomographyEyePatchExtractor {
         frameWidth: Int,
         frameHeight: Int
     ) -> CVPixelBuffer? {
-        guard landmarks.count >= 478 else { return nil }
+        // 468 (base FaceMesh / CoreML) or 478 (attention mesh). Every index
+        // used below is < 468, so the base mesh is sufficient.
+        guard landmarks.count >= 468 else { return nil }
 
         // 1. Get the 4 corner landmarks + center (MediaPipe indices).
         let lefttop = pixelPoint(landmarks[103], frameWidth, frameHeight)

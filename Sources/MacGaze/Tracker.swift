@@ -25,6 +25,7 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
     public enum LandmarkBackend: String, CaseIterable, Sendable {
         case mediaPipe = "MediaPipe (478-pt, default)"
         case vision = "Apple Vision (76-pt, fallback)"
+        case coreMLFaceMesh = "CoreML FaceMesh (468-pt, ANE)"
     }
 
     public var backend: LandmarkBackend
@@ -43,6 +44,9 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
     // MediaPipe backend components.
     private var mediaPipe: MediaPipeFaceLandmarker?
     private var mediaPipeTimestampMs: Int64 = 0
+
+    // CoreML FaceMesh (ANE) backend.
+    private var coreMLMesh: CoreMLFaceMeshLandmarker?
 
     // State.
     private let stateLock = NSLock()
@@ -63,6 +67,15 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
         self.displayName = "Built-in Camera (MacGaze)"
         self.driverIdentifier = "macgaze.builtin"
         self.backend = backend
+        // A/B override: MACGAZE_BACKEND=coreml | mediapipe | vision
+        if let env = ProcessInfo.processInfo.environment["MACGAZE_BACKEND"]?.lowercased() {
+            switch env {
+            case "coreml", "coremlfacemesh", "facemesh": self.backend = .coreMLFaceMesh
+            case "mediapipe", "mp": self.backend = .mediaPipe
+            case "vision": self.backend = .vision
+            default: break
+            }
+        }
         self.camera = CameraCapture()
         self.blazeGazeRunner = try? BlazeGazeRunner()
         self.rbfCorrector = RBFGazeCorrector()
@@ -78,6 +91,16 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
                     self.backend = .vision
                 }
             } else {
+                self.backend = .vision
+            }
+        }
+
+        // Load the CoreML FaceMesh model if requested.
+        if backend == .coreMLFaceMesh {
+            if let url = Self.resolveFaceMeshModelURL() {
+                self.coreMLMesh = try? CoreMLFaceMeshLandmarker(modelURL: url)
+            }
+            if coreMLMesh == nil {
                 self.backend = .vision
             }
         }
@@ -212,7 +235,38 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
             return processFrameMediaPipe(frame)
         case .vision:
             return processFrameVision(frame)
+        case .coreMLFaceMesh:
+            return processFrameCoreMLMesh(frame)
         }
+    }
+
+    // MARK: CoreML FaceMesh pipeline (ANE landmarks → same homography path)
+
+    private func processFrameCoreMLMesh(_ frame: CameraFrame) -> GazeSample {
+        guard let coreMLMesh, let blazeGazeRunner else { return GazeSample.invalid() }
+
+        guard let result = coreMLMesh.detect(pixelBuffer: frame.pixelBuffer),
+              result.landmarks.count >= 468 else {
+            return GazeSample.invalid()
+        }
+
+        guard let eyePatch = HomographyEyePatchExtractor.extract(
+            pixelBuffer: frame.pixelBuffer,
+            landmarks: result.landmarks,
+            frameWidth: frame.width,
+            frameHeight: frame.height
+        ) else {
+            return GazeSample.invalid()
+        }
+
+        // Head pose: TODO (Phase 2.2) derive via PnP from the 468 mesh. For now
+        // BlazeGaze runs without it, like the Vision path when pose is absent.
+        return runBlazeGazeAndSmooth(
+            eyePatch: eyePatch,
+            headVector: nil,
+            faceOrigin: nil,
+            blazeGazeRunner: blazeGazeRunner
+        )
     }
 
     // MARK: MediaPipe pipeline
@@ -404,5 +458,16 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
             FileManager.default.currentDirectoryPath + "/macgaze/Frameworks/face_landmarker_v2_with_blendshapes.task",
         ]
         return candidates.first { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    private static func resolveFaceMeshModelURL() -> URL? {
+        let cwd = FileManager.default.currentDirectoryPath
+        let candidates = [
+            "Models/face_mesh.mlmodelc",
+            cwd + "/Models/face_mesh.mlmodelc",
+            cwd + "/macgaze/Models/face_mesh.mlmodelc",
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0) }
+            .map { URL(fileURLWithPath: $0) }
     }
 }

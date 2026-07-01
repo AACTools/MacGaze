@@ -1,6 +1,9 @@
 import Foundation
 import CoreML
 import CoreGraphics
+import CoreImage
+import CoreVideo
+import Vision
 
 /// Runs the base-468 MediaPipe FaceMesh via CoreML (ANE) and returns landmarks
 /// in the same full-image normalized space MediaPipe produced, so the existing
@@ -24,11 +27,96 @@ public final class CoreMLFaceMeshLandmarker {
     }
 
     private let model: MLModel
+    private var lastLandmarks: [[Double]]?
+    private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
     public init(modelURL: URL) throws {
         let cfg = MLModelConfiguration()
         cfg.computeUnits = .all
         model = try MLModel(contentsOf: modelURL, configuration: cfg)
+    }
+
+    // MARK: High-level detect (Vision bootstrap + landmark tracking)
+
+    /// Detect landmarks for a camera frame. Same convention as
+    /// `MediaPipeFaceLandmarker.detect` so it drops into the pipeline.
+    public func detect(pixelBuffer: CVPixelBuffer) -> Result? {
+        guard let image = Self.cgImage(from: pixelBuffer) else { return nil }
+        return detect(image: image)
+    }
+
+    /// Track from the previous frame's landmarks when possible; otherwise
+    /// bootstrap from a Vision face rect then re-crop to the landmark bbox
+    /// (2-pass) — MediaPipe's detect-then-track design.
+    public func detect(image: CGImage) -> Result? {
+        let w = image.width, h = image.height
+
+        if let last = lastLandmarks,
+           let crop = Self.trackCrop(from: last, width: w, height: h),
+           let tracked = run(image: image, cropRect: crop), tracked.score >= 0.5 {
+            lastLandmarks = tracked.landmarks
+            return tracked
+        }
+
+        guard let visionRect = Self.visionFaceRect(image) else {
+            lastLandmarks = nil
+            return nil
+        }
+        let crop1 = Self.squareCrop(cx: visionRect.midX, cy: visionRect.midY,
+                                    side: max(visionRect.width, visionRect.height) * 1.4,
+                                    width: w, height: h)
+        guard let pass1 = run(image: image, cropRect: crop1),
+              let crop2 = Self.trackCrop(from: pass1.landmarks, width: w, height: h),
+              let pass2 = run(image: image, cropRect: crop2) else {
+            lastLandmarks = nil
+            return nil
+        }
+        lastLandmarks = pass2.landmarks
+        return pass2
+    }
+
+    // MARK: Crop / image helpers
+
+    /// Square crop = landmark bbox × 1.5 (the validated framing).
+    private static func trackCrop(from landmarks: [[Double]], width: Int, height: Int) -> CGRect? {
+        guard !landmarks.isEmpty else { return nil }
+        var minX = 1.0, minY = 1.0, maxX = 0.0, maxY = 0.0
+        for p in landmarks {
+            minX = min(minX, p[0]); maxX = max(maxX, p[0])
+            minY = min(minY, p[1]); maxY = max(maxY, p[1])
+        }
+        let x0 = minX * Double(width), x1 = maxX * Double(width)
+        let y0 = minY * Double(height), y1 = maxY * Double(height)
+        let side = max(x1 - x0, y1 - y0) * 1.5
+        return squareCrop(cx: (x0 + x1) / 2, cy: (y0 + y1) / 2, side: side,
+                          width: width, height: height)
+    }
+
+    private static func squareCrop(cx: Double, cy: Double, side: Double,
+                                   width: Int, height: Int) -> CGRect {
+        var x0 = max(0, cx - side / 2)
+        var y0 = max(0, cy - side / 2)
+        let s = min(side, Double(width) - x0, Double(height) - y0)
+        x0 = min(x0, Double(width) - s)
+        y0 = min(y0, Double(height) - s)
+        return CGRect(x: x0, y: y0, width: s, height: s)
+    }
+
+    private static func visionFaceRect(_ image: CGImage) -> CGRect? {
+        let request = VNDetectFaceRectanglesRequest()
+        try? VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+        guard let face = request.results?.first else { return nil }
+        let bb = face.boundingBox   // normalized, bottom-left origin
+        let x = bb.origin.x * Double(image.width)
+        let y = (1.0 - bb.origin.y - bb.height) * Double(image.height)  // → top-left
+        return CGRect(x: x, y: y,
+                      width: bb.width * Double(image.width),
+                      height: bb.height * Double(image.height))
+    }
+
+    private static func cgImage(from pixelBuffer: CVPixelBuffer) -> CGImage? {
+        let ci = CIImage(cvPixelBuffer: pixelBuffer)
+        return ciContext.createCGImage(ci, from: ci.extent)
     }
 
     /// Run FaceMesh on a square pixel crop (top-left origin) of `image`.
