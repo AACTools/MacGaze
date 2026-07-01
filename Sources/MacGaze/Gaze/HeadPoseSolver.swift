@@ -1,5 +1,4 @@
 import Foundation
-import Accelerate
 
 /// Reconstructs head pose from FaceMesh landmarks (for the CoreML path, which —
 /// unlike MediaPipe — has no facial-transformation matrix), producing the
@@ -89,7 +88,9 @@ public enum HeadPoseSolver {
 
     private static func clamp(_ v: Double) -> Double { max(-1.0, min(1.0, v)) }
 
-    /// Kabsch: rotation aligning centred P onto centred Q (minimises ‖R·P − Q‖).
+    /// Kabsch via Horn's quaternion method (no LAPACK). Rotation R such that
+    /// q_i ≈ R·p_i (aligns centred canonical P onto observed Q). Always a proper
+    /// rotation, so no reflection fix needed.
     static func kabschRotation(from P: [(Double, Double, Double)],
                                to Q: [(Double, Double, Double)]) -> [[Double]]? {
         guard P.count == Q.count, P.count >= 3 else { return nil }
@@ -101,65 +102,46 @@ public enum HeadPoseSolver {
         }
         let cP = centroid(P), cQ = centroid(Q)
 
-        // H = Σ (P_i - cP)(Q_i - cQ)^T   (3×3)
-        var H = [Double](repeating: 0, count: 9)
+        // Cross-covariance S = Σ (P_i-cP)(Q_i-cQ)^T
+        var Sxx = 0.0, Sxy = 0.0, Sxz = 0.0
+        var Syx = 0.0, Syy = 0.0, Syz = 0.0
+        var Szx = 0.0, Szy = 0.0, Szz = 0.0
         for i in 0..<P.count {
-            let p = (P[i].0 - cP.0, P[i].1 - cP.1, P[i].2 - cP.2)
-            let q = (Q[i].0 - cQ.0, Q[i].1 - cQ.1, Q[i].2 - cQ.2)
-            let pv = [p.0, p.1, p.2], qv = [q.0, q.1, q.2]
-            for r in 0..<3 { for c in 0..<3 { H[r * 3 + c] += pv[r] * qv[c] } }
+            let px = P[i].0 - cP.0, py = P[i].1 - cP.1, pz = P[i].2 - cP.2
+            let qx = Q[i].0 - cQ.0, qy = Q[i].1 - cQ.1, qz = Q[i].2 - cQ.2
+            Sxx += px*qx; Sxy += px*qy; Sxz += px*qz
+            Syx += py*qx; Syy += py*qy; Syz += py*qz
+            Szx += pz*qx; Szy += pz*qy; Szz += pz*qz
         }
 
-        guard let (U, V) = svd3x3(H) else { return nil }
-        // R = V · U^T, with a sign fix so det(R) = +1 (no reflection).
-        var R = matMul3(V, transpose3(U))
-        if det3(R) < 0 {
-            // Flip sign of V's last column and recompute.
-            var Vf = V
-            Vf[2] = -Vf[2]; Vf[5] = -Vf[5]; Vf[8] = -Vf[8]
-            R = matMul3(Vf, transpose3(U))
+        // Symmetric 4×4 N (Horn 1987).
+        var N = [
+            [Sxx + Syy + Szz, Syz - Szy,        Szx - Sxz,        Sxy - Syx],
+            [Syz - Szy,       Sxx - Syy - Szz,  Sxy + Syx,        Szx + Sxz],
+            [Szx - Sxz,       Sxy + Syx,       -Sxx + Syy - Szz,  Syz + Szy],
+            [Sxy - Syx,       Szx + Sxz,        Syz + Szy,       -Sxx - Syy + Szz],
+        ]
+        // Shift to positive-definite so power iteration finds the most-positive
+        // eigenvalue (the optimal rotation quaternion).
+        var shift = 1.0
+        for r in 0..<4 { for c in 0..<4 { shift += abs(N[r][c]) } }
+        for i in 0..<4 { N[i][i] += shift }
+
+        // Power iteration → dominant eigenvector = quaternion [w, x, y, z].
+        var v = [1.0, 0.0, 0.0, 0.0]
+        for _ in 0..<128 {
+            var nv = [0.0, 0.0, 0.0, 0.0]
+            for r in 0..<4 { var s = 0.0; for c in 0..<4 { s += N[r][c] * v[c] }; nv[r] = s }
+            let mag = (nv[0]*nv[0] + nv[1]*nv[1] + nv[2]*nv[2] + nv[3]*nv[3]).squareRoot()
+            guard mag > 1e-12 else { return nil }
+            for i in 0..<4 { v[i] = nv[i] / mag }
         }
-        return [[R[0], R[1], R[2]], [R[3], R[4], R[5]], [R[6], R[7], R[8]]]
-    }
 
-    // MARK: 3×3 linear algebra (row-major flat arrays)
-
-    /// SVD of a 3×3 (row-major) via LAPACK dgesvd. Returns (U, Vt-transposed→V).
-    private static func svd3x3(_ a: [Double]) -> (U: [Double], V: [Double])? {
-        // LAPACK is column-major; transpose in/out.
-        var A = transpose3(a)
-        var m = __CLPK_integer(3), n = __CLPK_integer(3), lda = __CLPK_integer(3)
-        var s = [Double](repeating: 0, count: 3)
-        var u = [Double](repeating: 0, count: 9)
-        var vt = [Double](repeating: 0, count: 9)
-        var ldu = __CLPK_integer(3), ldvt = __CLPK_integer(3)
-        var work = [Double](repeating: 0, count: 200)
-        var lwork = __CLPK_integer(200)
-        var info = __CLPK_integer(0)
-        var jobu = Int8(UInt8(ascii: "A")), jobvt = Int8(UInt8(ascii: "A"))
-        dgesvd_(&jobu, &jobvt, &m, &n, &A, &lda, &s, &u, &ldu, &vt, &ldvt,
-                &work, &lwork, &info)
-        guard info == 0 else { return nil }
-        // A was column-major: u is U (col-major) → transpose to row-major.
-        // vt is V^T (col-major) → its transpose (row-major) is V^T; we want V.
-        let U = transpose3(u)        // row-major U
-        let V = vt                    // col-major V^T == row-major V
-        return (U, V)
-    }
-
-    private static func transpose3(_ a: [Double]) -> [Double] {
-        [a[0], a[3], a[6], a[1], a[4], a[7], a[2], a[5], a[8]]
-    }
-    private static func matMul3(_ a: [Double], _ b: [Double]) -> [Double] {
-        var r = [Double](repeating: 0, count: 9)
-        for i in 0..<3 { for j in 0..<3 { var s = 0.0
-            for k in 0..<3 { s += a[i * 3 + k] * b[k * 3 + j] }
-            r[i * 3 + j] = s } }
-        return r
-    }
-    private static func det3(_ a: [Double]) -> Double {
-        a[0] * (a[4] * a[8] - a[5] * a[7])
-        - a[1] * (a[3] * a[8] - a[5] * a[6])
-        + a[2] * (a[3] * a[7] - a[4] * a[6])
+        let w = v[0], x = v[1], y = v[2], z = v[3]
+        return [
+            [1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y)],
+            [2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y)],
+        ]
     }
 }

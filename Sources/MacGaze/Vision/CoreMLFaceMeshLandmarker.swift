@@ -139,10 +139,13 @@ public final class CoreMLFaceMeshLandmarker {
         for i in 0..<count {
             let cropX = lm[i * 3 + 0].doubleValue / 192.0   // crop-normalized
             let cropY = lm[i * 3 + 1].doubleValue / 192.0
-            let z = lm[i * 3 + 2].doubleValue
+            let cropZ = lm[i * 3 + 2].doubleValue / 192.0
             let fullX = (originX + cropX * side) / width
             let fullY = (originY + cropY * side) / height
-            landmarks.append([fullX, fullY, z])
+            // z is relative depth (no origin); keep it on the same normalized
+            // scale as x (÷ image width), matching MediaPipe's convention.
+            let fullZ = cropZ * side / width
+            landmarks.append([fullX, fullY, fullZ])
         }
         let score = 1.0 / (1.0 + exp(-sc[0].doubleValue))
         return Result(landmarks: landmarks, score: score)
