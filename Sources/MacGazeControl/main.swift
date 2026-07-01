@@ -241,6 +241,7 @@ struct MacGazeControl {
         let landmarks: [[Double]]
         var headVector: MLMultiArray? = nil
         var faceOrigin: MLMultiArray? = nil
+        var rotationR: [[Double]]? = nil
 
         if let mesh = coreMLMesh {
             // CoreML FaceMesh (ANE) + reconstructed head pose (Kabsch).
@@ -250,8 +251,9 @@ struct MacGazeControl {
             if let pose = HeadPoseSolver.solve(landmarks: r.landmarks,
                                                width: frame.width, height: frame.height) {
                 headVector = makeVec(pose.headVector)
-                faceOrigin = makeVec(pose.faceOrigin3D)
             }
+            faceOrigin = makeVec(MetricFaceOrigin.compute(
+                landmarks: r.landmarks, width: frame.width, height: frame.height))
         } else if let landmarker {
             // MediaPipe VIDEO mode needs strictly-increasing timestamps; the
             // camera's can duplicate a millisecond and wedge the graph. Use a
@@ -272,24 +274,21 @@ struct MacGazeControl {
                 let cp = cos(hPitch), sp = sin(hPitch)
                 let cy = cos(hYaw), sy = sin(hYaw)
                 headVector = try? MLMultiArray(shape: [1, 3], dataType: .float32)
-                faceOrigin = try? MLMultiArray(shape: [1, 3], dataType: .float32)
                 if let hv = headVector {
                     hv[0] = Float(cp * sy) as NSNumber
                     hv[1] = Float(sp) as NSNumber
                     hv[2] = Float(-cp * cy) as NSNumber
                 }
-                if let fo = faceOrigin {
-                    fo[0] = Float(ft[0][3]) as NSNumber
-                    fo[1] = Float(ft[1][3]) as NSNumber
-                    fo[2] = Float(ft[2][3]) as NSNumber
-                }
+                rotationR = [
+                    [ft[0][0], ft[0][1], ft[0][2]],
+                    [ft[1][0], ft[1][1], ft[1][2]],
+                    [ft[2][0], ft[2][1], ft[2][2]],
+                ]
 
                 // Validation: Kabsch head pose vs MediaPipe ground truth.
                 if let pose = HeadPoseSolver.solve(landmarks: landmarks,
                                                    width: frame.width, height: frame.height) {
-                    let R = [[ft[0][0], ft[0][1], ft[0][2]],
-                             [ft[1][0], ft[1][1], ft[1][2]],
-                             [ft[2][0], ft[2][1], ft[2][2]]]
+                    let R = rotationR!
                     let gt = HeadPoseSolver.headVector(from: R)
                     let e = angleDeg(gt, pose.headVector)
                     hpErrorSum += e; hpErrorN += 1
@@ -309,6 +308,13 @@ struct MacGazeControl {
             frameWidth: frame.width,
             frameHeight: frame.height
         ) else { return nil }
+
+        // Metric face origin (cm) for whichever backend produced `landmarks`.
+        if faceOrigin == nil {
+            faceOrigin = makeVec(MetricFaceOrigin.compute(
+                landmarks: landmarks, width: frame.width, height: frame.height,
+                rotationR: rotationR))
+        }
 
         return blazeGaze.predict(eyePatch: eyePatch, headVector: headVector, faceOrigin3D: faceOrigin)
     }

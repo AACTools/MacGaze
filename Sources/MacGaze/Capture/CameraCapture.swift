@@ -178,8 +178,9 @@ public final class CameraCapture: @unchecked Sendable {
 
     // MARK: Frame stream
 
-    /// Async stream of camera frames. Single-consumer for Phase 0; if you
-    /// need fan-out, wrap with `for await ... in stream.multicast(...)`.
+    /// Async stream of camera frames. Single-consumer by design; the consumer
+    /// (MacGazeTracker's frame loop) is demand-driven, so it stays fast enough
+    /// to keep up with capture and frames never accumulate.
     public var frames: AsyncStream<CameraFrame> {
         AsyncStream { continuation in
             continuationBox.set(continuation)

@@ -14,10 +14,8 @@ hardware eyetuitive driver — same UI, same pipeline, no external device.
   → **RBF personalisation** → screen point.
 - Three landmark backends exist (`coreMLFaceMesh` / `mediaPipe` / `vision`).
   **`coreMLFaceMesh` is the default** (Apple Silicon ANE, no Python dylib).
-- The full validated pipeline lives in the **`macgaze-control` CLI**. The GUI
-  library (`MacGazeTracker`) is **missing one wiring step** on the CoreML path
-  — it doesn't feed head pose into BlazeGaze. See
-  [§ Known divergence](#known-divergence--cli-vs-library).
+- All three implementations now feed real head pose into BlazeGaze; the
+  `macgaze-control` CLI remains the **validated reference**.
 
 ## Pipeline (one frame)
 
@@ -41,7 +39,7 @@ flowchart TD
     lmk --> patch["HomographyEyePatchExtractor<br/>WebEyeTrack obtain_eyepatch()<br/>4-pt perspective warp → 128×512"]
     lmk --> pose["Head pose<br/>head_vector + face_origin_3d"]
 
-    pose -. "coreMLFaceMesh path:<br/>HeadPoseSolver (Kabsch→canonical)<br/>⚠ NOT wired in library" .-> blaze
+    pose -. "coreMLFaceMesh path:<br/>HeadPoseSolver (Kabsch→canonical)" .-> blaze
     pose -. "mediaPipe path:<br/>faceTransform matrix" .-> blaze
     pose -. "vision path:<br/>HeadPoseEstimator (PnP)" .-> blaze
 
@@ -156,26 +154,21 @@ flowchart LR
 This lets the GazeBridge Track Status panel show live face/depth/video even
 while cursor injection is paused.
 
-## Known divergence — CLI vs library
+## Implementations — CLI vs library
 
-There are **three** places the gaze pipeline is implemented, and they have
-drifted. This is the single most important thing to know about MacGaze today.
+The gaze pipeline exists in **three** places. They are now consistent (all feed
+real head pose to BlazeGaze); the CLI is still the benchmark for accuracy.
 
 | Implementation | CoreML head pose | MediaPipe head pose | Used by |
 |---|---|---|---|
 | **`macgaze-control` CLI** (`Sources/MacGazeControl/main.swift`) | ✅ `HeadPoseSolver.solve` | ✅ `faceTransform` | live cursor tool — **the validated reference** |
 | `macgaze-replay` CLI | n/a (Vision) | ✅ | offline video eval |
-| **`MacGazeTracker` library** (`Tracker.swift`) | ❌ passes `nil` | ✅ `faceTransform` | **GazeBridge GUI (default backend)** |
+| **`MacGazeTracker` library** (`Tracker.swift`) | ✅ `HeadPoseSolver.solve` | ✅ `faceTransform` | GazeBridge GUI (default backend) |
 
-The GUI library's CoreML path (`Tracker.swift:352` `processFrameCoreMLMesh`)
-calls `runBlazeGazeAndSmooth(eyePatch:, headVector: nil, faceOrigin: nil, …)`.
-With neutral head pose, BlazeGaze's predictions are biased/unreliable — its
-own doc comment says *"Zero-shot accuracy with neutral head pose will be poor."*
-
-**Fix:** port the `macgaze-control` pipeline's
-`HeadPoseSolver.solve(...)` block (`main.swift:250`) into
-`processFrameCoreMLMesh`. One block of code; the solver already exists and was
-validated against the MediaPipe ground truth in that same CLI.
+`MacGazeTracker.processFrameCoreMLMesh` reconstructs head pose via
+`HeadPoseSolver.solve(...)` (the same Kabsch→canonical solver validated against
+the MediaPipe ground truth in `macgaze-control`). If the solver returns nil for
+a frame, BlazeGaze falls back to neutral head pose for that frame only.
 
 ## Backends
 
@@ -202,10 +195,8 @@ app constructs `MacGazeTracker(backend: .coreMLFaceMesh)`.
 
 ## Open work
 
-1. **Wire `HeadPoseSolver` into `MacGazeTracker.processFrameCoreMLMesh`** (the
-   divergence above) — the default GUI backend is running BlazeGaze blind.
-2. GazeBridge's UI Snapping defaults on and magnetises the cursor to the Dock
+1. GazeBridge's UI Snapping defaults on and magnetises the cursor to the Dock
    (bottom of screen) — affects MacGaze worse than eyetuitive because the raw
    signal drifts more.
-3. `deviceInformation()` still reports `"MediaPipe" / "Vision"` in its firmware
+2. `deviceInformation()` still reports `"MediaPipe" / "Vision"` in its firmware
    string and ignores the `coreMLFaceMesh` backend — cosmetic.

@@ -177,34 +177,62 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
         videoBus.subscribe(replayLatest: true)
     }
 
-    // MARK: Always-on frame loop (gaze + positioning + video fan-out)
+    // MARK: Demand-driven frame loop (gaze + positioning + video fan-out)
 
-    /// Sole consumer of `camera.frames`. Processes each frame once and
-    /// distributes results to the gaze / positioning / video buses so any
-    /// combination of subscribers is served without re-running detection.
+    /// Sole consumer of `camera.frames`. Work is scaled to demand so we never
+    /// saturate the CPU and get jetsam-killed:
+    ///
+    /// • gaze subscriber attached (cursor injection / calibration) → run the
+    ///   full pipeline every frame: landmarks → homography eye patch → head
+    ///   pose → BlazeGaze → RBF. This is the only path that needs the expensive
+    ///   homography warp + CNN inference.
+    /// • only positioning/video wanted (Track Status open, cursor paused) →
+    ///   run the cheap face-detect path, throttled to ~10 fps.
+    /// • nobody listening → consume the frame and do nothing, so the camera
+    ///   queue drains instead of backing up.
     private func startFrameLoop() {
         frameLoopTask?.cancel()
         frameLoopTask = Task { [weak self] in
             guard let self else { return }
-            // Throttle raw video emission to ~12 fps; the BGRA copy is
-            // non-trivial and Track Status only renders ~15 fps anyway.
-            let minVideoInterval: TimeInterval = 1.0 / 12.0
-            var lastVideoEmit = Date.distantPast
+            let auxInterval: TimeInterval = 1.0 / 10.0      // positioning/video idle cap
+            let videoInterval: TimeInterval = 1.0 / 12.0
+            var lastAux = Date.distantPast
+            var lastVideo = Date.distantPast
             for await frame in self.camera.frames {
                 if Task.isCancelled { break }
-
                 let now = Date()
-                if now.timeIntervalSince(lastVideoEmit) >= minVideoInterval {
-                    if let vf = Self.makeVideoFrame(from: frame) {
-                        self.videoBus.yield(vf)
+
+                // Full gaze pipeline only while a gaze consumer is attached.
+                if self.gazeBus.hasSubscribers {
+                    let (sample, faceBox) = self.analyzeFrame(frame)
+                    self.gazeBus.yield(sample)
+                    if let box = faceBox {
+                        self.positioningBus.yield(Self.makePositioning(faceBox: box))
                     }
-                    lastVideoEmit = now
+                    if now.timeIntervalSince(lastVideo) >= videoInterval,
+                       let vf = Self.makeVideoFrame(from: frame) {
+                        self.videoBus.yield(vf)
+                        lastVideo = now
+                    }
+                    continue
                 }
 
-                let (sample, faceBox) = self.analyzeFrame(frame)
-                self.gazeBus.yield(sample)
-                if let box = faceBox {
+                // Idle / Track-Status-only: nothing to do unless someone wants
+                // positioning or video.
+                guard self.positioningBus.hasSubscribers || self.videoBus.hasSubscribers else {
+                    continue
+                }
+                if now.timeIntervalSince(lastAux) < auxInterval { continue }
+                lastAux = now
+
+                if let box = self.faceBoxOnly(frame) {
                     self.positioningBus.yield(Self.makePositioning(faceBox: box))
+                }
+                if self.videoBus.hasSubscribers,
+                   now.timeIntervalSince(lastVideo) >= videoInterval,
+                   let vf = Self.makeVideoFrame(from: frame) {
+                    self.videoBus.yield(vf)
+                    lastVideo = now
                 }
             }
             self.gazeBus.clear()
@@ -248,6 +276,25 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
         }
         guard minX.isFinite, maxX > minX, maxY > minY else { return nil }
         return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    /// Reconstruct BlazeGaze's `head_vector` + `face_origin_3d` from FaceMesh
+    /// landmarks via `HeadPoseSolver`. Returns nil on failure — BlazeGaze then
+    /// falls back to neutral head pose. Mirrors the macgaze-control CLI path.
+    private static func headPose(
+        fromLandmarks landmarks: [[Double]], width: Int, height: Int
+    ) -> (headVector: MLMultiArray, faceOrigin: MLMultiArray)? {
+        guard let pose = HeadPoseSolver.solve(landmarks: landmarks, width: width, height: height),
+              let hv = makeVec(pose.headVector),
+              let fo = makeVec(pose.faceOrigin3D) else { return nil }
+        return (hv, fo)
+    }
+
+    private static func makeVec(_ v: [Float]) -> MLMultiArray? {
+        guard v.count == 3,
+              let a = try? MLMultiArray(shape: [1, 3], dataType: .float32) else { return nil }
+        a[0] = v[0] as NSNumber; a[1] = v[1] as NSNumber; a[2] = v[2] as NSNumber
+        return a
     }
 
     /// Copy a BGRA `CVPixelBuffer` into a tightly-packed `TrackerVideoFrame`,
@@ -347,6 +394,31 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
         }
     }
 
+    /// Cheap path for when only positioning/video is wanted (no gaze consumer):
+    /// run the landmarker purely for a face box, skipping the expensive
+    /// homography eye-patch + head pose + BlazeGaze inference.
+    private func faceBoxOnly(_ frame: CameraFrame) -> CGRect? {
+        switch backend {
+        case .coreMLFaceMesh:
+            guard let coreMLMesh,
+                  let r = coreMLMesh.detect(pixelBuffer: frame.pixelBuffer),
+                  r.landmarks.count >= 468 else { return nil }
+            return Self.faceBox(fromLandmarks: r.landmarks)
+        case .mediaPipe:
+            guard let mediaPipe else { return nil }
+            mediaPipeTimestampMs += 33
+            guard let r = try? mediaPipe.detect(
+                pixelBuffer: frame.pixelBuffer, timestampMs: mediaPipeTimestampMs
+            ), r.landmarks.count >= 468 else { return nil }
+            return Self.faceBox(fromLandmarks: r.landmarks)
+        case .vision:
+            let d = visionDetector.detect(frame)
+            guard d.stats.faceFound, let b = d.observation?.boundingBox else { return nil }
+            // Vision box is bottom-left origin; flip to top-left.
+            return CGRect(x: b.minX, y: 1 - b.maxY, width: b.width, height: b.height)
+        }
+    }
+
     // MARK: CoreML FaceMesh pipeline (ANE landmarks → same homography path)
 
     private func processFrameCoreMLMesh(_ frame: CameraFrame) -> (GazeSample, CGRect?) {
@@ -368,12 +440,18 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
             return (GazeSample.invalid(), faceBox)
         }
 
-        // Head pose: TODO (Phase 2.2) derive via PnP from the 468 mesh. For now
-        // BlazeGaze runs without it, like the Vision path when pose is absent.
+        // Head pose reconstructed from the 468-pt mesh (Kabsch alignment to the
+        // canonical face model), matching the validated macgaze-control CLI.
+        let headPose = Self.headPose(fromLandmarks: result.landmarks,
+                                     width: frame.width, height: frame.height)
+        // Metric face origin (cm) — BlazeGaze was trained with WebEyeTrack's
+        // cm-scale face_origin_3d; pixel-scale values put it out of distribution.
+        let faceOrigin = Self.makeVec(MetricFaceOrigin.compute(
+            landmarks: result.landmarks, width: frame.width, height: frame.height))
         let sample = runBlazeGazeAndSmooth(
             eyePatch: eyePatch,
-            headVector: nil,
-            faceOrigin: nil,
+            headVector: headPose?.headVector,
+            faceOrigin: faceOrigin,
             blazeGazeRunner: blazeGazeRunner
         )
         return (sample, faceBox)
@@ -413,7 +491,7 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
 
         // 3. Head pose from facial transformation matrix.
         var headVector: MLMultiArray? = nil
-        var faceOrigin: MLMultiArray? = nil
+        var rotationR: [[Double]]? = nil
         if let ft = mpResult.faceTransform, ft.count == 4, ft[0].count >= 3 {
             let r20 = ft[2][0], r21 = ft[2][1], r22 = ft[2][2]
             let pitch = asin(-r20), yaw = atan2(r21, r22)
@@ -421,18 +499,21 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
             let cp = cos(hPitch), sp = sin(hPitch)
             let cy = cos(hYaw), sy = sin(hYaw)
             headVector = try? MLMultiArray(shape: [1, 3], dataType: .float32)
-            faceOrigin = try? MLMultiArray(shape: [1, 3], dataType: .float32)
             if let hv = headVector {
                 hv[0] = Float(cp * sy) as NSNumber
                 hv[1] = Float(sp) as NSNumber
                 hv[2] = Float(-cp * cy) as NSNumber
             }
-            if let fo = faceOrigin {
-                fo[0] = Float(ft[0][3]) as NSNumber
-                fo[1] = Float(ft[1][3]) as NSNumber
-                fo[2] = Float(ft[2][3]) as NSNumber
-            }
+            rotationR = [
+                [ft[0][0], ft[0][1], ft[0][2]],
+                [ft[1][0], ft[1][1], ft[1][2]],
+                [ft[2][0], ft[2][1], ft[2][2]],
+            ]
         }
+        // Metric face origin (cm) — see processFrameCoreMLMesh.
+        let faceOrigin = Self.makeVec(MetricFaceOrigin.compute(
+            landmarks: mpResult.landmarks, width: frame.width, height: frame.height,
+            rotationR: rotationR))
 
         let sample = runBlazeGazeAndSmooth(
             eyePatch: eyePatch,
@@ -626,6 +707,13 @@ private final class Bus<T: Sendable>: @unchecked Sendable {
                 self.lock.unlock()
             }
         }
+    }
+
+    /// Whether anyone is currently subscribed. Used by the frame loop to decide
+    /// whether the heavy gaze pipeline needs to run.
+    var hasSubscribers: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !subscribers.isEmpty
     }
 
     func yield(_ value: T) {
