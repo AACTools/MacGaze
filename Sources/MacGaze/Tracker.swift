@@ -250,8 +250,7 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
         var faceOrigin: MLMultiArray? = nil
         if let ft = mpResult.faceTransform, ft.count == 4, ft[0].count >= 3 {
             let r20 = ft[2][0], r21 = ft[2][1], r22 = ft[2][2]
-            let r10 = ft[1][0], r00 = ft[0][0]
-            let pitch = asin(-r20), yaw = atan2(r21, r22), roll = atan2(r10, r00)
+            let pitch = asin(-r20), yaw = atan2(r21, r22)
             let hPitch = -yaw, hYaw = pitch
             let cp = cos(hPitch), sp = sin(hPitch)
             let cy = cos(hYaw), sy = sin(hYaw)
