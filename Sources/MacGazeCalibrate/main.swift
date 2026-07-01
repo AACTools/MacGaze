@@ -93,6 +93,15 @@ struct MacGazeCalibrate {
             print("  (x:\(target.x), y:\(target.y))")
             print()
 
+            // Voice prompt.
+            DispatchQueue.global().async {
+                let task = Process()
+                task.launchPath = "/usr/bin/say"
+                task.arguments = ["Look \(target.name)"]
+                try? task.run()
+                task.waitUntilExit()
+            }
+
             // Countdown.
             for count in stride(from: 3, through: 1, by: -1) {
                 print("  \(count)...", terminator: "")
@@ -112,6 +121,9 @@ struct MacGazeCalibrate {
                 timestampMs += 33
                 if let gaze = runPipeline(frame: frame, landmarker: landmarker, blazeGaze: blazeGaze) {
                     gazeOutputs.append((Double(gaze.x), Double(gaze.y)))
+                    if gazeOutputs.count <= 2 {
+                        print("\n    [debug] gaze x=\(gaze.x) y=\(gaze.y)", terminator: "")
+                    }
                 }
 
                 // Progress dots.
@@ -190,9 +202,7 @@ struct MacGazeCalibrate {
             errorCount += 1
 
             let status = err < 0.05 ? "✓" : (err < 0.15 ? "~" : "✗")
-            print(String(format: "║ %@ %-6s raw(%.3f,%.3f) → corr(%.3f,%.3f) err=%.3f",
-                        status, target.name, r.observedX, r.observedY,
-                        corrected.x, corrected.y, err))
+            print("  \(status) \(target.name)  raw(\(String(format: "%.3f", r.observedX)),\(String(format: "%.3f", r.observedY))) → corr(\(String(format: "%.3f", corrected.x)),\(String(format: "%.3f", corrected.y))) err=\(String(format: "%.3f", err))")
         }
 
         if errorCount > 0 {
