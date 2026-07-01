@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CoreML
 import ApplicationServices
 import MacGaze
 
@@ -229,7 +230,33 @@ struct MacGazeControl {
             frameHeight: frame.height
         ) else { return nil }
 
-        return blazeGaze.predict(eyePatch: eyePatch, headVector: nil, faceOrigin3D: nil)
+        // Compute head pose from MediaPipe facial transformation matrix
+        // (same as macgaze-calibrate — without this, BlazeGaze predictions
+        // are in a completely different coordinate space).
+        var headVector: MLMultiArray? = nil
+        var faceOrigin: MLMultiArray? = nil
+        if let ft = mpResult.faceTransform, ft.count == 4, ft[0].count >= 3 {
+            let r20 = ft[2][0], r21 = ft[2][1], r22 = ft[2][2]
+            let r10 = ft[1][0], r00 = ft[0][0]
+            let pitch = asin(-r20), yaw = atan2(r21, r22), roll = atan2(r10, r00)
+            let hPitch = -yaw, hYaw = pitch
+            let cp = cos(hPitch), sp = sin(hPitch)
+            let cy = cos(hYaw), sy = sin(hYaw)
+            headVector = try? MLMultiArray(shape: [1, 3], dataType: .float32)
+            faceOrigin = try? MLMultiArray(shape: [1, 3], dataType: .float32)
+            if let hv = headVector {
+                hv[0] = Float(cp * sy) as NSNumber
+                hv[1] = Float(sp) as NSNumber
+                hv[2] = Float(-cp * cy) as NSNumber
+            }
+            if let fo = faceOrigin {
+                fo[0] = Float(ft[0][3]) as NSNumber
+                fo[1] = Float(ft[1][3]) as NSNumber
+                fo[2] = Float(ft[2][3]) as NSNumber
+            }
+        }
+
+        return blazeGaze.predict(eyePatch: eyePatch, headVector: headVector, faceOrigin3D: faceOrigin)
     }
 
     static func say(_ text: String) {
