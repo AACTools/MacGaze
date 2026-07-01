@@ -47,12 +47,29 @@ struct MacGazeControl {
             print("ERROR: BlazeGaze model not found. Run ./scripts/setup.sh")
             exit(EXIT_FAILURE)
         }
-        let modelPath = resolveModelPath()
-        guard let landmarker = modelPath.flatMap({ try? MediaPipeFaceLandmarker(modelPath: $0) }) else {
-            print("ERROR: MediaPipe model not found. Run ./scripts/setup.sh")
-            exit(EXIT_FAILURE)
+        // Backend: MACGAZE_BACKEND=coreml selects the ANE FaceMesh path.
+        let envBackend = ProcessInfo.processInfo.environment["MACGAZE_BACKEND"]?.lowercased() ?? ""
+        let useCoreML = ["coreml", "coremlfacemesh", "facemesh"].contains(envBackend)
+
+        var coreMLMesh: CoreMLFaceMeshLandmarker? = nil
+        var landmarker: MediaPipeFaceLandmarker? = nil
+        if useCoreML {
+            guard let url = resolveFaceMeshURL(),
+                  let mesh = try? CoreMLFaceMeshLandmarker(modelURL: url) else {
+                print("ERROR: CoreML FaceMesh not found (Models/face_mesh.mlmodelc). Run ./scripts/setup.sh")
+                exit(EXIT_FAILURE)
+            }
+            coreMLMesh = mesh
+            print("  Backend: CoreML FaceMesh (ANE) ✓")
+        } else {
+            guard let path = resolveModelPath(),
+                  let mp = try? MediaPipeFaceLandmarker(modelPath: path) else {
+                print("ERROR: MediaPipe model not found. Run ./scripts/setup.sh")
+                exit(EXIT_FAILURE)
+            }
+            landmarker = mp
+            print("  Backend: MediaPipe ✓")
         }
-        print("  MediaPipe: ✓")
         print("  BlazeGaze: ✓")
 
         // Start camera.
@@ -69,7 +86,7 @@ struct MacGazeControl {
         print("  Warming up...", terminator: "")
         fflush(stdout)
         for await frame in camera.frames {
-            _ = runPipeline(frame: frame, landmarker: landmarker, blazeGaze: blazeGaze)
+            _ = runPipeline(frame: frame, landmarker: landmarker, coreMLMesh: coreMLMesh, blazeGaze: blazeGaze)
             break
         }
         print(" done ✓")
@@ -104,7 +121,7 @@ struct MacGazeControl {
                 for await frame in camera.frames {
                     if Date().timeIntervalSince(start) >= 2.0 { break }
                     timestampMs += 33
-                    if let g = runPipeline(frame: frame, landmarker: landmarker, blazeGaze: blazeGaze) {
+                    if let g = runPipeline(frame: frame, landmarker: landmarker, coreMLMesh: coreMLMesh, blazeGaze: blazeGaze) {
                         outputs.append((Double(g.x), Double(g.y)))
                     }
                     print(".", terminator: "")
@@ -174,7 +191,7 @@ struct MacGazeControl {
             fpsFrames += 1
 
             let pipeStart = CFAbsoluteTimeGetCurrent()
-            guard let gaze = runPipeline(frame: frame, landmarker: landmarker, blazeGaze: blazeGaze) else {
+            guard let gaze = runPipeline(frame: frame, landmarker: landmarker, coreMLMesh: coreMLMesh, blazeGaze: blazeGaze) else {
                 let pipeMs = (CFAbsoluteTimeGetCurrent() - pipeStart) * 1000
                 print(String(format: "  [%@] NO FACE  pipe=%.0fms  frameGap=%.0fms",
                              timeString(from: startTime), pipeMs, captureAge))
@@ -220,49 +237,70 @@ struct MacGazeControl {
 
     static func runPipeline(
         frame: CameraFrame,
-        landmarker: MediaPipeFaceLandmarker,
+        landmarker: MediaPipeFaceLandmarker?,
+        coreMLMesh: CoreMLFaceMeshLandmarker?,
         blazeGaze: BlazeGazeRunner
     ) -> CGPoint? {
-        guard let mpResult = try? landmarker.detect(
-            pixelBuffer: frame.pixelBuffer,
-            timestampMs: Int64(frame.timestampSeconds * 1000)
-        ) else { return nil }
-        guard mpResult.landmarks.count >= 478 else { return nil }
+        let landmarks: [[Double]]
+        var headVector: MLMultiArray? = nil
+        var faceOrigin: MLMultiArray? = nil
+
+        if let mesh = coreMLMesh {
+            // CoreML FaceMesh (ANE). No head pose yet (Phase 2.2 = PnP).
+            guard let r = mesh.detect(pixelBuffer: frame.pixelBuffer),
+                  r.landmarks.count >= 468 else { return nil }
+            landmarks = r.landmarks
+        } else if let landmarker {
+            guard let mpResult = try? landmarker.detect(
+                pixelBuffer: frame.pixelBuffer,
+                timestampMs: Int64(frame.timestampSeconds * 1000)
+            ), mpResult.landmarks.count >= 468 else { return nil }
+            landmarks = mpResult.landmarks
+
+            // Head pose from MediaPipe's facial transformation matrix (without
+            // this, BlazeGaze predictions land in a different coordinate space).
+            if let ft = mpResult.faceTransform, ft.count == 4, ft[0].count >= 3 {
+                let r20 = ft[2][0], r21 = ft[2][1], r22 = ft[2][2]
+                let pitch = asin(-r20), yaw = atan2(r21, r22)
+                let hPitch = -yaw, hYaw = pitch
+                let cp = cos(hPitch), sp = sin(hPitch)
+                let cy = cos(hYaw), sy = sin(hYaw)
+                headVector = try? MLMultiArray(shape: [1, 3], dataType: .float32)
+                faceOrigin = try? MLMultiArray(shape: [1, 3], dataType: .float32)
+                if let hv = headVector {
+                    hv[0] = Float(cp * sy) as NSNumber
+                    hv[1] = Float(sp) as NSNumber
+                    hv[2] = Float(-cp * cy) as NSNumber
+                }
+                if let fo = faceOrigin {
+                    fo[0] = Float(ft[0][3]) as NSNumber
+                    fo[1] = Float(ft[1][3]) as NSNumber
+                    fo[2] = Float(ft[2][3]) as NSNumber
+                }
+            }
+        } else {
+            return nil
+        }
 
         guard let eyePatch = HomographyEyePatchExtractor.extract(
             pixelBuffer: frame.pixelBuffer,
-            landmarks: mpResult.landmarks,
+            landmarks: landmarks,
             frameWidth: frame.width,
             frameHeight: frame.height
         ) else { return nil }
 
-        // Compute head pose from MediaPipe facial transformation matrix
-        // (same as macgaze-calibrate — without this, BlazeGaze predictions
-        // are in a completely different coordinate space).
-        var headVector: MLMultiArray? = nil
-        var faceOrigin: MLMultiArray? = nil
-        if let ft = mpResult.faceTransform, ft.count == 4, ft[0].count >= 3 {
-            let r20 = ft[2][0], r21 = ft[2][1], r22 = ft[2][2]
-            let r10 = ft[1][0], r00 = ft[0][0]
-            let pitch = asin(-r20), yaw = atan2(r21, r22), roll = atan2(r10, r00)
-            let hPitch = -yaw, hYaw = pitch
-            let cp = cos(hPitch), sp = sin(hPitch)
-            let cy = cos(hYaw), sy = sin(hYaw)
-            headVector = try? MLMultiArray(shape: [1, 3], dataType: .float32)
-            faceOrigin = try? MLMultiArray(shape: [1, 3], dataType: .float32)
-            if let hv = headVector {
-                hv[0] = Float(cp * sy) as NSNumber
-                hv[1] = Float(sp) as NSNumber
-                hv[2] = Float(-cp * cy) as NSNumber
-            }
-            if let fo = faceOrigin {
-                fo[0] = Float(ft[0][3]) as NSNumber
-                fo[1] = Float(ft[1][3]) as NSNumber
-                fo[2] = Float(ft[2][3]) as NSNumber
-            }
-        }
-
         return blazeGaze.predict(eyePatch: eyePatch, headVector: headVector, faceOrigin3D: faceOrigin)
+    }
+
+    static func resolveFaceMeshURL() -> URL? {
+        let cwd = FileManager.default.currentDirectoryPath
+        let candidates = [
+            "Models/face_mesh.mlmodelc",
+            cwd + "/Models/face_mesh.mlmodelc",
+            cwd + "/macgaze/Models/face_mesh.mlmodelc",
+        ]
+        return candidates.first { FileManager.default.fileExists(atPath: $0) }
+            .map { URL(fileURLWithPath: $0) }
     }
 
     static func say(_ text: String) {
