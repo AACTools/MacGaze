@@ -53,8 +53,15 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
     private var _connectionState: TrackerConnectionState = .disconnected
     private var stateContinuations: [UUID: AsyncStream<TrackerConnectionState>.Continuation] = [:]
 
-    // Active streams.
-    private var gazeStreamTask: Task<Void, Never>?
+    // Active frame-processing loop + fan-out buses.  A single loop consumes
+    // `camera.frames` (keeping camera access single-consumer) and distributes
+    // gaze samples, positioning info, and raw video to whichever streams are
+    // subscribed.  This lets Track Status show live face/depth/video while the
+    // cursor is paused — parity with the eyetuitive device's always-on feed.
+    private var frameLoopTask: Task<Void, Never>?
+    private let gazeBus = Bus<GazeSample>()
+    private let positioningBus = Bus<PositioningInfo>()
+    private let videoBus = Bus<TrackerVideoFrame>()
 
     // 1-Euro filter for smoothing.
     private var smootherX = OneEuroFilter()
@@ -134,6 +141,7 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
         setState(.connecting)
         do {
             try await camera.start()
+            startFrameLoop()
             setState(.connected)
         } catch {
             setState(.connectionFailed(error.localizedDescription))
@@ -142,8 +150,11 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
     }
 
     public func disconnect() async {
-        gazeStreamTask?.cancel()
-        gazeStreamTask = nil
+        frameLoopTask?.cancel()
+        frameLoopTask = nil
+        gazeBus.clear()
+        positioningBus.clear()
+        videoBus.clear()
         camera.stop()
         setState(.disconnected)
     }
@@ -151,29 +162,122 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
     // MARK: TrackerDriver — Gaze stream
 
     public func gazeStream(unfiltered: Bool) -> AsyncStream<GazeSample> {
-        AsyncStream { continuation in
-            gazeStreamTask?.cancel()
-            gazeStreamTask = Task { [weak self] in
-                guard let self else { return }
-                for await frame in self.camera.frames {
-                    if Task.isCancelled { break }
-                    let sample = self.processFrame(frame)
-                    continuation.yield(sample)
-                }
-                continuation.finish()
-            }
-            continuation.onTermination = { [weak self] _ in
-                self?.gazeStreamTask?.cancel()
-            }
-        }
+        gazeBus.subscribe(replayLatest: false)
     }
 
     // MARK: TrackerDriver — Positioning
 
     public func positioningStream() -> AsyncStream<PositioningInfo> {
-        AsyncStream { continuation in
-            continuation.finish()
+        positioningBus.subscribe(replayLatest: true)
+    }
+
+    // MARK: TrackerDriver — Video
+
+    public func videoStream() -> AsyncStream<TrackerVideoFrame>? {
+        videoBus.subscribe(replayLatest: true)
+    }
+
+    // MARK: Always-on frame loop (gaze + positioning + video fan-out)
+
+    /// Sole consumer of `camera.frames`. Processes each frame once and
+    /// distributes results to the gaze / positioning / video buses so any
+    /// combination of subscribers is served without re-running detection.
+    private func startFrameLoop() {
+        frameLoopTask?.cancel()
+        frameLoopTask = Task { [weak self] in
+            guard let self else { return }
+            // Throttle raw video emission to ~12 fps; the BGRA copy is
+            // non-trivial and Track Status only renders ~15 fps anyway.
+            let minVideoInterval: TimeInterval = 1.0 / 12.0
+            var lastVideoEmit = Date.distantPast
+            for await frame in self.camera.frames {
+                if Task.isCancelled { break }
+
+                let now = Date()
+                if now.timeIntervalSince(lastVideoEmit) >= minVideoInterval {
+                    if let vf = Self.makeVideoFrame(from: frame) {
+                        self.videoBus.yield(vf)
+                    }
+                    lastVideoEmit = now
+                }
+
+                let (sample, faceBox) = self.analyzeFrame(frame)
+                self.gazeBus.yield(sample)
+                if let box = faceBox {
+                    self.positioningBus.yield(Self.makePositioning(faceBox: box))
+                }
+            }
+            self.gazeBus.clear()
         }
+    }
+
+    /// Build a `PositioningInfo` from the detected face box (normalized,
+    /// top-left origin).  Depth is a rough estimate from face-width fraction;
+    /// eye "open" states default to open (blink detection not yet wired).
+    private static func makePositioning(faceBox box: CGRect) -> PositioningInfo {
+        let widthFrac = max(0.08, min(0.6, Double(box.width)))
+        // Empirical: a face ~0.26 of frame width ≈ 600 mm on a typical
+        // FaceTime HD.  Clamp to the depth-zone range the UI understands.
+        let depthMM = max(350.0, min(950.0, 160.0 / widthFrac))
+        let cy = Double(box.midY)
+        let leftX = min(1.0, max(0.0, Double(box.minX) + widthFrac * 0.30))
+        let rightX = min(1.0, max(0.0, Double(box.maxX) - widthFrac * 0.30))
+        return PositioningInfo(
+            depthInMM: depthMM,
+            leftEyePos: CGPoint(x: leftX, y: cy),
+            rightEyePos: CGPoint(x: rightX, y: cy),
+            leftEyeClosed: false,
+            rightEyeClosed: false,
+            gazeIsPaused: false
+        )
+    }
+
+    /// Normalized bounding rect (top-left origin) of an array of [x, y(, z)]
+    /// landmark points in image space.
+    private static func faceBox(fromLandmarks landmarks: [[Double]]) -> CGRect? {
+        guard !landmarks.isEmpty else { return nil }
+        var minX = Double.infinity, minY = Double.infinity
+        var maxX = -Double.infinity, maxY = -Double.infinity
+        for lm in landmarks {
+            guard lm.count >= 2 else { continue }
+            let x = lm[0], y = lm[1]
+            if x < minX { minX = x }
+            if y < minY { minY = y }
+            if x > maxX { maxX = x }
+            if y > maxY { maxY = y }
+        }
+        guard minX.isFinite, maxX > minX, maxY > minY else { return nil }
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    /// Copy a BGRA `CVPixelBuffer` into a tightly-packed `TrackerVideoFrame`,
+    /// de-striding if the capture surface has row padding.
+    private static func makeVideoFrame(from frame: CameraFrame) -> TrackerVideoFrame? {
+        let pb = frame.pixelBuffer
+        let width = CVPixelBufferGetWidth(pb)
+        let height = CVPixelBufferGetHeight(pb)
+        let stride = CVPixelBufferGetBytesPerRow(pb)
+        guard width > 0, height > 0, stride > 0 else { return nil }
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
+        let tight = width * 4
+        let data: Data
+        if stride == tight {
+            data = Data(bytes: base, count: stride * height)
+        } else {
+            var packed = Data(capacity: tight * height)
+            for row in 0..<height {
+                let src = base.advanced(by: row * stride)
+                    .assumingMemoryBound(to: UInt8.self)
+                packed.append(UnsafeBufferPointer(start: src, count: tight))
+            }
+            data = packed
+        }
+        return TrackerVideoFrame(
+            width: width, height: height, channels: 4, data: data,
+            timestamp: Int64(frame.timestampSeconds * 1000)
+        )
     }
 
     // MARK: TrackerDriver — Device info
@@ -229,7 +333,10 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
 
     // MARK: Pipeline processing
 
-    private func processFrame(_ frame: CameraFrame) -> GazeSample {
+    /// Processes one camera frame, returning the gaze sample plus the detected
+    /// face bounding box (normalized, top-left origin) used for positioning.
+    /// `nil` box means no face was found this frame.
+    private func analyzeFrame(_ frame: CameraFrame) -> (GazeSample, CGRect?) {
         switch backend {
         case .mediaPipe:
             return processFrameMediaPipe(frame)
@@ -242,13 +349,15 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
 
     // MARK: CoreML FaceMesh pipeline (ANE landmarks → same homography path)
 
-    private func processFrameCoreMLMesh(_ frame: CameraFrame) -> GazeSample {
-        guard let coreMLMesh, let blazeGazeRunner else { return GazeSample.invalid() }
+    private func processFrameCoreMLMesh(_ frame: CameraFrame) -> (GazeSample, CGRect?) {
+        guard let coreMLMesh, let blazeGazeRunner else { return (GazeSample.invalid(), nil) }
 
         guard let result = coreMLMesh.detect(pixelBuffer: frame.pixelBuffer),
               result.landmarks.count >= 468 else {
-            return GazeSample.invalid()
+            return (GazeSample.invalid(), nil)
         }
+
+        let faceBox = Self.faceBox(fromLandmarks: result.landmarks)
 
         guard let eyePatch = HomographyEyePatchExtractor.extract(
             pixelBuffer: frame.pixelBuffer,
@@ -256,24 +365,25 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
             frameWidth: frame.width,
             frameHeight: frame.height
         ) else {
-            return GazeSample.invalid()
+            return (GazeSample.invalid(), faceBox)
         }
 
         // Head pose: TODO (Phase 2.2) derive via PnP from the 468 mesh. For now
         // BlazeGaze runs without it, like the Vision path when pose is absent.
-        return runBlazeGazeAndSmooth(
+        let sample = runBlazeGazeAndSmooth(
             eyePatch: eyePatch,
             headVector: nil,
             faceOrigin: nil,
             blazeGazeRunner: blazeGazeRunner
         )
+        return (sample, faceBox)
     }
 
     // MARK: MediaPipe pipeline
 
-    private func processFrameMediaPipe(_ frame: CameraFrame) -> GazeSample {
+    private func processFrameMediaPipe(_ frame: CameraFrame) -> (GazeSample, CGRect?) {
         guard let mediaPipe, let blazeGazeRunner else {
-            return GazeSample.invalid()
+            return (GazeSample.invalid(), nil)
         }
 
         mediaPipeTimestampMs += 33 // ~30fps
@@ -282,12 +392,14 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
         guard let mpResult = try? mediaPipe.detect(
             pixelBuffer: frame.pixelBuffer, timestampMs: mediaPipeTimestampMs
         ) else {
-            return GazeSample.invalid()
+            return (GazeSample.invalid(), nil)
         }
 
         guard mpResult.landmarks.count >= 478 else {
-            return GazeSample.invalid()
+            return (GazeSample.invalid(), nil)
         }
+
+        let faceBox = Self.faceBox(fromLandmarks: mpResult.landmarks)
 
         // 2. Homography eye patch (exact training format).
         guard let eyePatch = HomographyEyePatchExtractor.extract(
@@ -296,7 +408,7 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
             frameWidth: frame.width,
             frameHeight: frame.height
         ) else {
-            return GazeSample.invalid()
+            return (GazeSample.invalid(), faceBox)
         }
 
         // 3. Head pose from facial transformation matrix.
@@ -322,30 +434,40 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
             }
         }
 
-        return runBlazeGazeAndSmooth(
+        let sample = runBlazeGazeAndSmooth(
             eyePatch: eyePatch,
             headVector: headVector,
             faceOrigin: faceOrigin,
             blazeGazeRunner: blazeGazeRunner
         )
+        return (sample, faceBox)
     }
 
     // MARK: Vision pipeline (fallback)
 
-    private func processFrameVision(_ frame: CameraFrame) -> GazeSample {
-        guard let blazeGazeRunner else { return GazeSample.invalid() }
+    private func processFrameVision(_ frame: CameraFrame) -> (GazeSample, CGRect?) {
+        guard let blazeGazeRunner else { return (GazeSample.invalid(), nil) }
 
         let detection = visionDetector.detect(frame)
 
+        // Vision bounding box is normalized with origin bottom-left; flip to
+        // top-left so it matches the landmark-based boxes and the rendering.
+        let faceBox: CGRect? = detection.observation.map {
+            CGRect(x: $0.boundingBox.minX,
+                   y: 1 - $0.boundingBox.maxY,
+                   width: $0.boundingBox.width,
+                   height: $0.boundingBox.height)
+        }
+
         guard detection.stats.faceFound,
               let vnFace = visionDetector.lastRawObservation else {
-            return GazeSample.invalid()
+            return (GazeSample.invalid(), faceBox)
         }
 
         guard let eyePatch = visionEyePatch.extract(
             frame: frame.pixelBuffer, faceObservation: vnFace
         ) else {
-            return GazeSample.invalid()
+            return (GazeSample.invalid(), faceBox)
         }
 
         var headVector: MLMultiArray? = nil
@@ -367,12 +489,13 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
             }
         }
 
-        return runBlazeGazeAndSmooth(
+        let sample = runBlazeGazeAndSmooth(
             eyePatch: eyePatch,
             headVector: headVector,
             faceOrigin: faceOrigin,
             blazeGazeRunner: blazeGazeRunner
         )
+        return (sample, faceBox)
     }
 
     // MARK: Shared BlazeGaze + smoothing + RBF
@@ -473,5 +596,50 @@ public final class MacGazeTracker: TrackerDriver, @unchecked Sendable {
         ]
         return candidates.first { FileManager.default.fileExists(atPath: $0) }
             .map { URL(fileURLWithPath: $0) }
+    }
+}
+
+/// Thread-safe multi-subscriber broadcast for a value type.  Used to fan a
+/// single camera-frame analysis out to the gaze / positioning / video streams.
+private final class Bus<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var subscribers: [UUID: AsyncStream<T>.Continuation] = [:]
+    private var latest: T?
+
+    /// Subscribe to future values.  When `replayLatest` is true, the most
+    /// recently yielded value (if any) is emitted immediately so a late
+    /// subscriber sees current state without waiting for the next frame.
+    func subscribe(replayLatest: Bool) -> AsyncStream<T> {
+        AsyncStream { continuation in
+            let id = UUID()
+            lock.lock()
+            subscribers[id] = continuation
+            let snapshot = latest
+            lock.unlock()
+            if replayLatest, let snapshot {
+                continuation.yield(snapshot)
+            }
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                self.lock.lock()
+                self.subscribers.removeValue(forKey: id)
+                self.lock.unlock()
+            }
+        }
+    }
+
+    func yield(_ value: T) {
+        lock.lock()
+        latest = value
+        let conts = Array(subscribers.values)
+        lock.unlock()
+        for c in conts { c.yield(value) }
+    }
+
+    func clear() {
+        lock.lock()
+        subscribers.removeAll()
+        latest = nil
+        lock.unlock()
     }
 }
