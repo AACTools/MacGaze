@@ -161,16 +161,27 @@ struct MacGazeControl {
         let startTime = Date()
         var lastFpsTime = startTime
         var fpsFrames = 0
+        var prevTimestamp: CFAbsoluteTime = 0
 
         // Main loop: camera → gaze → cursor.
         for await frame in camera.frames {
+            let nowTs = CFAbsoluteTimeGetCurrent()
+            let captureAge = prevTimestamp > 0 ? (nowTs - prevTimestamp) * 1000 : 0
+            prevTimestamp = nowTs
+
             let nowMs = Int64(Date().timeIntervalSince(startTime) * 1000)
             frameCount += 1
             fpsFrames += 1
 
+            let pipeStart = CFAbsoluteTimeGetCurrent()
             guard let gaze = runPipeline(frame: frame, landmarker: landmarker, blazeGaze: blazeGaze) else {
+                let pipeMs = (CFAbsoluteTimeGetCurrent() - pipeStart) * 1000
+                print(String(format: "  [%@] NO FACE  pipe=%.0fms  frameGap=%.0fms",
+                             timeString(from: startTime), pipeMs, captureAge))
+                fflush(stdout)
                 continue
             }
+            let pipeMs = (CFAbsoluteTimeGetCurrent() - pipeStart) * 1000
 
             // RBF correct.
             let corrected = rbf.correct(x: Double(gaze.x), y: Double(gaze.y))
@@ -197,16 +208,11 @@ struct MacGazeControl {
                 event.post(tap: .cghidEventTap)
             }
 
-            // FPS report every 2 seconds.
-            let elapsed = Date().timeIntervalSince(lastFpsTime)
-            if elapsed >= 2.0 {
-                let fps = Double(fpsFrames) / elapsed
-                print(String(format: "  %.0f fps  gaze(%.2f,%.2f) → screen(%.0f,%.0f)",
-                             fps, sx, sy, px, py))
-                fflush(stdout)
-                lastFpsTime = Date()
-                fpsFrames = 0
-            }
+            // Print every frame with timestamps.
+            print(String(format: "  [%@] pipe=%.0fms  gap=%.0fms  raw(%.2f,%.2f) → corr(%.2f,%.2f) → screen(%.0f,%.0f)",
+                         timeString(from: startTime), pipeMs, captureAge,
+                         gaze.x, gaze.y, sx, sy, px, py))
+            fflush(stdout)
         }
     }
 
@@ -267,6 +273,13 @@ struct MacGazeControl {
             try? task.run()
             task.waitUntilExit()
         }
+    }
+
+    static func timeString(from start: Date) -> String {
+        let elapsed = Date().timeIntervalSince(start)
+        let mins = Int(elapsed) / 60
+        let secs = elapsed - Double(mins) * 60
+        return String(format: "%d:%04.1f", mins, secs)
     }
 
     static func resolveModelPath() -> String? {
