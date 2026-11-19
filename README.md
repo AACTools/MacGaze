@@ -187,4 +187,4 @@ repos under the same parent directory.
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+MPL-2.0 — see [LICENSE](LICENSE).
